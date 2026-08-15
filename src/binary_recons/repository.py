@@ -235,6 +235,14 @@ def validate_candidate(
             errors.append("support insertion contains a function definition")
         if re.search(r"\b%s\s*\(" % re.escape(candidate.symbol), insertion.content):
             errors.append("target prototype belongs in the managed prototype file")
+        if reserved_symbols is not None:
+            inserted_functions = set(
+                re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", insertion.content)
+            )
+            for symbol in sorted(inserted_functions & reserved_symbols):
+                errors.append(
+                    "support insertion redeclares existing function: %s" % symbol
+                )
     if errors:
         raise ValueError("; ".join(errors))
 

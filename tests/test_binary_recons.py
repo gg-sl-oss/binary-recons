@@ -423,6 +423,38 @@ void OperationalLabel(void)
         )
         self.assertEqual(len(candidate.source), 6000)
 
+    def test_candidate_schema_removes_line_end_whitespace(self) -> None:
+        candidate = Candidate(
+            symbol="ComputeFixtureValue",
+            prototype="int ComputeFixtureValue(void)",
+            source=(
+                "/* Function start: 0x401000 */  \n"
+                "int ComputeFixtureValue(void)\t\n"
+                "{\n"
+                "    return 7;   \n"
+                "}"
+            ),
+            supporting_insertions=[
+                SupportingInsertion(
+                    path="include/globals.h",
+                    content="extern int g_fixture;  \n\n",
+                )
+            ],
+        )
+
+        self.assertEqual(
+            candidate.source,
+            "/* Function start: 0x401000 */\n"
+            "int ComputeFixtureValue(void)\n"
+            "{\n"
+            "    return 7;\n"
+            "}",
+        )
+        self.assertEqual(
+            candidate.supporting_insertions[0].content,
+            "extern int g_fixture;",
+        )
+
     def test_missing_address_marker_is_added_mechanically(self) -> None:
         candidate = Candidate(
             symbol="ComputeFixtureValue",
@@ -562,6 +594,39 @@ int ComputeFixtureValue(void)
 
             with self.assertRaisesRegex(
                 ValueError, "target prototype belongs in the managed prototype file"
+            ):
+                validate_candidate(
+                    candidate,
+                    target.with_candidate_contract(candidate),
+                    set(repository.reserved_symbols(target)),
+                    repository.allowed_support_paths(),
+                )
+
+    def test_supporting_content_cannot_redeclare_an_existing_function(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            make_fixture_project(root)
+            repository = ProjectRepository(root)
+            target = repository.resolve_target(0x00401000)
+            candidate = Candidate(
+                symbol="ComputeFixtureValue",
+                prototype="int ComputeFixtureValue(void)",
+                source="""/* Function start: 0x401000 */
+int ComputeFixtureValue(void)
+{
+    return 7;
+}""",
+                supporting_insertions=[
+                    SupportingInsertion(
+                        path="include/functions.h",
+                        content="int ExistingHelper(int invented_parameter);",
+                    )
+                ],
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "support insertion redeclares existing function: ExistingHelper",
             ):
                 validate_candidate(
                     candidate,

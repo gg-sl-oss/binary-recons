@@ -27,6 +27,12 @@ MAX_SUPPORTING_INSERTION_CHARS = 8000
 MAX_SUPPORTING_TOTAL_CHARS = 24000
 
 
+def _clean_multiline_text(value: str) -> str:
+    """Strip model-added line-end whitespace before content reaches the workspace."""
+
+    return "\n".join(line.rstrip() for line in value.splitlines()).strip()
+
+
 class ServerMode(str, Enum):
     MANAGED = "managed"
     EXTERNAL = "external"
@@ -58,10 +64,15 @@ class SupportingInsertion(BaseModel):
         ),
     )
 
-    @field_validator("path", "content")
+    @field_validator("path")
     @classmethod
-    def strip_text(cls, value: str) -> str:
+    def strip_path(cls, value: str) -> str:
         return value.strip()
+
+    @field_validator("content")
+    @classmethod
+    def strip_content(cls, value: str) -> str:
+        return _clean_multiline_text(value)
 
 
 class Candidate(BaseModel):
@@ -100,7 +111,7 @@ class Candidate(BaseModel):
     @field_validator("source")
     @classmethod
     def strip_source(cls, value: str) -> str:
-        return value.strip()
+        return _clean_multiline_text(value)
 
     @field_validator("prototype")
     @classmethod
