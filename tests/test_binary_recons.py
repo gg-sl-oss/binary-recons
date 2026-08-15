@@ -40,7 +40,10 @@ from binary_recons.repository import (  # noqa: E402
     replace_or_insert_function,
     validate_candidate,
 )
-from binary_recons.search import ReconstructionSearch  # noqa: E402
+from binary_recons.search import (  # noqa: E402
+    ReconstructionSearch,
+    _select_symbol_proposal,
+)
 
 
 FAKE_SERVER = r"""
@@ -239,6 +242,76 @@ int EstablishedName(void)
             target = ProjectRepository(root).resolve_target(0x00401000)
             self.assertEqual(target.symbol, "EstablishedName")
             self.assertEqual(target.prototype, "int EstablishedName(void)")
+
+    def test_reopen_contract_hides_an_existing_weak_interface(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            make_fixture_project(root)
+            write_fixture(
+                root,
+                "src/sample.c",
+                """/* Function start: 0x401000 */
+int DialogProc(void)
+{
+    return 7;
+}
+""",
+            )
+            with (
+                patch("binary_recons.cli.DEFAULT_MODEL_PATH", None),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                result = main(
+                    [
+                        "--project-root",
+                        str(root),
+                        "--address",
+                        "0x401000",
+                        "--reopen-contract",
+                        "--dry-run-prompt",
+                    ]
+                )
+
+            self.assertEqual(result, 0)
+            prompts = list(
+                (root / "artifacts/reconstruction/local-model/00401000").glob(
+                    "*/iteration-01.prompt.txt"
+                )
+            )
+            self.assertEqual(len(prompts), 1)
+            prompt = prompts[0].read_text(encoding="utf-8")
+            self.assertIn("No source-level name or interface is supplied", prompt)
+            self.assertNotIn("DialogProc", prompt)
+
+    def test_bare_mechanism_function_name_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            make_fixture_project(root)
+            repository = ProjectRepository(root)
+            target = repository.resolve_target(0x00401000)
+            candidate = Candidate(
+                symbol="DialogProc",
+                prototype="int DialogProc(void)",
+                source="""/* Function start: 0x401000 */
+int DialogProc(void)
+{
+    return 7;
+}""",
+            )
+
+            with self.assertRaisesRegex(ValueError, "meaningful source-level name"):
+                validate_candidate(
+                    candidate,
+                    target.with_candidate_contract(candidate),
+                    set(repository.reserved_symbols(target)),
+                    repository.allowed_support_paths(),
+                )
+            self.assertEqual(
+                _select_symbol_proposal(
+                    ["DialogProc", "ScorePanelDialogProc"], set(), 0x00401000
+                ),
+                "ScorePanelDialogProc",
+            )
 
     def test_insertion_is_address_sorted(self) -> None:
         source = """/* Function start: 0x100 */
@@ -872,6 +945,110 @@ int ComputeFixtureValue(void)
                 },
             )
             self.assertEqual(len(selected["candidate"]["supporting_insertions"]), 3)
+
+    def test_duplicate_compile_repair_uses_the_remaining_attempt(self) -> None:
+        failing = Candidate(
+            symbol="ComputeFixtureValue",
+            prototype="int ComputeFixtureValue(void)",
+            source="""/* Function start: 0x401000 */
+int ComputeFixtureValue(void)
+{
+    return missing_fixture_value;
+}""",
+        )
+        repaired = Candidate(
+            symbol="ComputeFixtureValue",
+            prototype="int ComputeFixtureValue(void)",
+            source="""/* Function start: 0x401000 */
+int ComputeFixtureValue(void)
+{
+    return 7;
+}""",
+        )
+
+        class FakeServer:
+            def __init__(self, *args: object):
+                pass
+
+            def __enter__(self) -> FakeServer:
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                pass
+
+        class FakeGenerator:
+            repair_prompts: list[str] = []
+
+            def __init__(self, *args: object):
+                pass
+
+            def generate(
+                self, prompt: str, iteration: int
+            ) -> tuple[CandidateBatch, dict[str, object]]:
+                return CandidateBatch(candidates=[failing]), {}
+
+            def repair(
+                self,
+                prompt: str,
+                iteration: int,
+                candidate_index: int,
+                repair_attempt: int,
+            ) -> tuple[Candidate, dict[str, object]]:
+                self.repair_prompts.append(prompt)
+                return (failing if repair_attempt == 1 else repaired), {}
+
+            def close(self) -> None:
+                pass
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            make_fixture_project(root)
+            repository = ProjectRepository(root)
+            target = repository.resolve_target(0x00401000)
+
+            def compare_candidate(*args: object) -> tuple[float | None, str]:
+                source = target.source_path.read_text(encoding="utf-8")
+                if "missing_fixture_value" in source:
+                    return (
+                        None,
+                        "sample.c(4) : error C2065: 'missing_fixture_value' : "
+                        "undeclared identifier",
+                    )
+                return 100.0, "Similarity: 100.00%"
+
+            repository.compare = compare_candidate  # type: ignore[method-assign]
+            config = SearchConfig(
+                seed=1,
+                max_iterations=1,
+                candidates_per_iteration=1,
+                compile_repair_attempts=2,
+            )
+            with (
+                patch("binary_recons.search.ManagedLlamaServer", FakeServer),
+                patch("binary_recons.search.CandidateGenerator", FakeGenerator),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                result = ReconstructionSearch(
+                    repository,
+                    target,
+                    config,
+                    LlamaServerConfig(model_path=None),
+                ).run()
+
+            self.assertTrue(result.target_reached)
+            self.assertEqual(result.attempts, 2)
+            self.assertEqual(len(FakeGenerator.repair_prompts), 2)
+            self.assertTrue(
+                all(
+                    "missing_fixture_value" in prompt
+                    for prompt in FakeGenerator.repair_prompts
+                )
+            )
+            first_repair = (
+                result.session_directory
+                / "iteration-01-candidate-01-repair-01.compare.txt"
+            )
+            self.assertIn("fingerprint already tried", first_repair.read_text())
 
     def test_unexpected_build_failure_restores_every_workspace_file(self) -> None:
         candidate = Candidate(

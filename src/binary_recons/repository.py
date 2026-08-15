@@ -30,6 +30,14 @@ COMPILER_ERROR_RE = re.compile(
     re.I | re.M,
 )
 SOURCE_SUFFIXES = frozenset({".c", ".cc", ".cpp", ".cxx"})
+GENERIC_FUNCTION_SYMBOL_RE = re.compile(
+    r"(?i)^(?:(?:FUN|sub|function|fn)_?[0-9a-f]*|helper|callback|handler|"
+    r"routine|procedure|proc|dialogproc|wndproc|windowproc|eventhandler)$"
+)
+
+
+def is_generic_function_symbol(symbol: str) -> bool:
+    return GENERIC_FUNCTION_SYMBOL_RE.fullmatch(symbol) is not None
 
 
 def declaration_for_symbol(text: str, symbol: str) -> str | None:
@@ -177,7 +185,7 @@ def validate_candidate(
         errors.append("candidate fields do not match the active target contract")
     if not re.search(r"\b%s\s*\(" % re.escape(candidate.symbol), source):
         errors.append("candidate must define the target symbol")
-    if re.match(r"(?i)^(?:FUN|sub|function|fn)_?[0-9a-f]*$", candidate.symbol):
+    if is_generic_function_symbol(candidate.symbol):
         errors.append("candidate symbol must be a meaningful source-level name")
     if "%X" % target.address in candidate.symbol.upper():
         errors.append("candidate symbol must not contain the target address")

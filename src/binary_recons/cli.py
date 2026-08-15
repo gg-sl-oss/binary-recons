@@ -55,6 +55,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--prototype",
         help="optional fixed prototype; default: model proposes one for new functions",
     )
+    target.add_argument(
+        "--reopen-contract",
+        action="store_true",
+        help=(
+            "discard an existing inferred name/prototype for this run and ask the "
+            "model to infer a replacement"
+        ),
+    )
 
     search = parser.add_argument_group("search")
     search.add_argument("--max-iterations", type=int, default=3)
@@ -129,7 +137,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.reopen_contract and (args.symbol is not None or args.prototype is not None):
+        parser.error(
+            "--reopen-contract cannot be combined with --symbol or --prototype"
+        )
     repository = ProjectRepository(args.project_root, args.config)
     target = repository.resolve_target(
         address=args.address,
@@ -137,6 +150,8 @@ def main(argv: list[str] | None = None) -> int:
         source=args.source,
         prototype=args.prototype,
     )
+    if args.reopen_contract:
+        target = target.model_copy(update={"symbol": None, "prototype": None})
     model_path = args.model_path
     model_alias = args.model
     if model_alias is None:

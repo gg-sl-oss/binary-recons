@@ -93,6 +93,10 @@ for use by later reconstructions. The same file may receive declarations for
 referenced non-target functions, while validation keeps the target declaration
 driver-managed. Existing definitions retain their established contract, and
 callers may still override it explicitly with `--symbol` and `--prototype`.
+Use `--reopen-contract` to ask the model for a replacement when an earlier
+inferred contract is weak; the old name and interface are excluded from the new
+prompt. Bare mechanism labels such as `DialogProc`, `WindowProc`, or `Helper`
+are rejected for inferred contracts.
 
 The prompt supplies already-selected function names as a reserved-name list,
 without exposing their interfaces, so independent model proposals cannot

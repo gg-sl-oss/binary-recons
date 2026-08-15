@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -20,6 +19,7 @@ from .repository import (
     ProjectRepository,
     candidate_fingerprint,
     current_function,
+    is_generic_function_symbol,
     normalize_candidate_marker,
     rename_candidate_symbol,
     validate_candidate,
@@ -52,7 +52,7 @@ def _select_symbol_proposal(
     for symbol in proposals:
         if symbol in reserved_symbols:
             continue
-        if re.match(r"(?i)^(?:FUN|sub|function|fn)_?[0-9a-f]*$", symbol):
+        if is_generic_function_symbol(symbol):
             continue
         if address_text in symbol.upper():
             continue
@@ -295,11 +295,11 @@ class ReconstructionSearch:
                                         break
 
                                     repair_attempt = repair_attempts_used + 1
-                                    name_collision = (
-                                        not contract_locked
-                                        and candidate.symbol in reserved_symbols
+                                    symbol_repair = not contract_locked and (
+                                        candidate.symbol in reserved_symbols
+                                        or is_generic_function_symbol(candidate.symbol)
                                     )
-                                    if name_collision:
+                                    if symbol_repair:
                                         repair_prompt = build_symbol_repair_prompt(
                                             batch_contract,
                                             evidence,
@@ -335,7 +335,7 @@ class ReconstructionSearch:
                                         ),
                                         flush=True,
                                     )
-                                    if name_collision:
+                                    if symbol_repair:
                                         proposals, repair_completion = (
                                             generator.propose_symbols(
                                                 repair_prompt,
@@ -404,7 +404,7 @@ class ReconstructionSearch:
                                     )
                                     repair_attempts_used = repair_attempt
                                     if repaired_fingerprint in seen:
-                                        feedback = (
+                                        duplicate_feedback = (
                                             "REPAIR SKIPPED: fingerprint already tried"
                                         )
                                         run_log.write_repair_candidate(
@@ -412,7 +412,7 @@ class ReconstructionSearch:
                                             index,
                                             repair_attempt,
                                             repaired_candidate,
-                                            feedback,
+                                            duplicate_feedback,
                                         )
                                         print(
                                             "iteration %d candidate %d repair %d: "
@@ -420,7 +420,7 @@ class ReconstructionSearch:
                                             % (iteration, index, repair_attempt),
                                             flush=True,
                                         )
-                                        break
+                                        continue
                                     seen.add(repaired_fingerprint)
                                     attempts += 1
                                     candidate = repaired_candidate
@@ -533,7 +533,7 @@ class ReconstructionSearch:
                                         repaired_candidate
                                     )
                                     if repaired_fingerprint in seen:
-                                        feedback = (
+                                        duplicate_feedback = (
                                             "REPAIR SKIPPED: fingerprint already tried"
                                         )
                                         run_log.write_repair_candidate(
@@ -541,7 +541,7 @@ class ReconstructionSearch:
                                             index,
                                             repair_attempt,
                                             repaired_candidate,
-                                            feedback,
+                                            duplicate_feedback,
                                         )
                                         print(
                                             "iteration %d candidate %d repair %d: "
@@ -549,7 +549,7 @@ class ReconstructionSearch:
                                             % (iteration, index, repair_attempt),
                                             flush=True,
                                         )
-                                        break
+                                        continue
 
                                     seen.add(repaired_fingerprint)
                                     attempts += 1
