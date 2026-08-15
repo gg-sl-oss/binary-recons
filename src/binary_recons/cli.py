@@ -72,10 +72,15 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("--build-timeout", type=float, default=120.0)
     search.add_argument("--format-retries", type=int, default=1)
     search.add_argument(
+        "--repair-attempts",
         "--compile-repair-attempts",
+        dest="compile_repair_attempts",
+        metavar="N",
         type=int,
         default=2,
-        help="focused LLM repair calls after build failures (0 disables)",
+        help=(
+            "focused LLM repair calls after validation or build failures (0 disables)"
+        ),
     )
     search.add_argument(
         "--seed",

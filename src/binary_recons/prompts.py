@@ -166,8 +166,8 @@ def build_compile_repair_prompt(
     repair_attempt: int,
 ) -> str:
     return f"""\
-Repair the failing source definition below. Produce exactly one complete corrected
-definition in the structured source field.
+Repair the failing change set below. Produce exactly one complete corrected
+structured change set.
 
 REPAIR PASS
 - Attempt {repair_attempt} of {config.compile_repair_attempts}.
@@ -179,10 +179,10 @@ REPAIR PASS
 
 TARGET CONTRACT
 - Marker: /* Function start: 0x{target.address:X} */
-- Symbol: {candidate.symbol}
-- Signature: {candidate.prototype}
-- Preserve the proposed name and interface unless a compiler diagnostic proves
-  that the interface is not accepted.
+- Symbol: {target.symbol}
+- Signature: {target.prototype}
+- Restore and preserve this active name and interface if the failing candidate
+  changed either one.
 - Return symbol, prototype, and source fields that agree exactly.
 - Define only the target; include no declarations or surrounding file text.
 - Return a complete repaired supporting_insertions list. It replaces, rather
@@ -200,7 +200,7 @@ COMPILATION CONSTRAINTS
 TARGET-PROJECT RULES
 {evidence.project_guidance}
 
-COMPILER DIAGNOSTICS
+BUILD / VALIDATION DIAGNOSTICS
 {compiler_feedback}
 
 MECHANICALLY DISCOVERED REFERENCED DECLARATIONS
@@ -210,5 +210,65 @@ ALLOWED SUPPORT FILES AND CURRENT CONTENT
 {evidence.supporting_file_evidence}
 
 FAILING COMPLETE CHANGE SET
+{candidate.model_dump_json(indent=2)}
+"""
+
+
+def build_validation_repair_prompt(
+    target: TargetSpec,
+    evidence: EvidenceBundle,
+    config: SearchConfig,
+    candidate: Candidate,
+    validation_feedback: str,
+    repair_attempt: int,
+) -> str:
+    if target.has_contract:
+        contract = f"""\
+- Active symbol: {target.symbol}
+- Active signature: {target.prototype}
+- The target contract is established. Preserve it exactly."""
+    else:
+        contract = """\
+- This target had no established source-level contract.
+- You may replace the proposed symbol and prototype when the validation failure
+  requires it. Keep symbol, prototype, and source definition mutually exact.
+- A replacement name must remain concise, meaningful, and grounded in the
+  target behavior; never use an address or generic operational label."""
+
+    return f"""\
+Repair the rejected change set below. Produce exactly one complete corrected
+structured change set.
+
+REPAIR PASS
+- Attempt {repair_attempt} of {config.compile_repair_attempts}.
+- This is a narrow pre-build validation repair, not a new reconstruction pass.
+- Preserve the implementation's behavior and source shape except where the
+  validation diagnostic requires a correction.
+- Fix every validation diagnostic shown. Do not explain the fix.
+
+TARGET CONTRACT
+- Marker: /* Function start: 0x{target.address:X} */
+{contract}
+- Return a complete supporting_insertions list replacing the failing list.
+
+TARGET-PROJECT RULES
+{evidence.project_guidance}
+
+VALIDATION DIAGNOSTICS
+{validation_feedback}
+
+RESERVED EXISTING SOURCE SYMBOLS
+{evidence.reserved_symbols}
+
+DECOMPILER HINT
+{evidence.decompiler_hint}
+
+MECHANICALLY DISCOVERED REFERENCED DECLARATIONS
+{evidence.declaration_evidence}
+
+ALLOWED SUPPORT FILES AND CURRENT CONTENT
+{evidence.supporting_file_evidence}
+
+REJECTED COMPLETE CHANGE SET
 {candidate.model_dump_json(indent=2)}
 """

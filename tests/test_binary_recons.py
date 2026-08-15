@@ -498,6 +498,118 @@ int ComputeFixtureValue(void)
         )
 
 
+class ValidationRepairTests(unittest.TestCase):
+    def test_reserved_name_rejection_gets_a_focused_contract_repair(self) -> None:
+        rejected = Candidate(
+            symbol="ExistingHelper",
+            prototype="void ExistingHelper(void)",
+            source="""/* Function start: 0x401000 */
+void ExistingHelper(void)
+{
+}""",
+        )
+        repaired = Candidate(
+            symbol="ComputeFixtureValue",
+            prototype="int ComputeFixtureValue(void)",
+            source="""/* Function start: 0x401000 */
+int ComputeFixtureValue(void)
+{
+    return 7;
+}""",
+        )
+
+        class FakeServer:
+            def __init__(self, *args: object):
+                pass
+
+            def __enter__(self) -> FakeServer:
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                pass
+
+        class FakeGenerator:
+            repair_prompts: list[str] = []
+
+            def __init__(self, *args: object):
+                pass
+
+            def generate(
+                self, prompt: str, iteration: int
+            ) -> tuple[CandidateBatch, dict[str, object]]:
+                return CandidateBatch(candidates=[rejected]), {}
+
+            def repair(
+                self,
+                prompt: str,
+                iteration: int,
+                candidate_index: int,
+                repair_attempt: int,
+            ) -> tuple[Candidate, dict[str, object]]:
+                self.repair_prompts.append(prompt)
+                return repaired, {}
+
+            def close(self) -> None:
+                pass
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            make_fixture_project(root)
+            repository = ProjectRepository(root)
+            target = repository.resolve_target(0x00401000)
+
+            def compare_candidate(*args: object) -> tuple[float | None, str]:
+                source = target.source_path.read_text(encoding="utf-8")
+                self.assertIn("int ComputeFixtureValue(void)", source)
+                self.assertNotIn("void ExistingHelper(void)\n{", source)
+                return 100.0, "Similarity: 100.00%"
+
+            repository.compare = compare_candidate  # type: ignore[method-assign]
+            config = SearchConfig(
+                seed=1,
+                max_iterations=1,
+                candidates_per_iteration=1,
+                compile_repair_attempts=1,
+            )
+            with (
+                patch("binary_recons.search.ManagedLlamaServer", FakeServer),
+                patch("binary_recons.search.CandidateGenerator", FakeGenerator),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                result = ReconstructionSearch(
+                    repository,
+                    target,
+                    config,
+                    LlamaServerConfig(model_path=None),
+                ).run()
+
+            self.assertTrue(result.target_reached)
+            self.assertEqual(result.attempts, 2)
+            self.assertEqual(result.symbol, "ComputeFixtureValue")
+            self.assertEqual(len(FakeGenerator.repair_prompts), 1)
+            self.assertIn(
+                "candidate symbol is already used",
+                FakeGenerator.repair_prompts[0],
+            )
+            self.assertIn(
+                "You may replace the proposed symbol", FakeGenerator.repair_prompts[0]
+            )
+            self.assertIn("ExistingHelper", FakeGenerator.repair_prompts[0])
+            self.assertIn(
+                "int ComputeFixtureValue(void); /* 0x00401000 */",
+                (root / "include/functions.h").read_text(encoding="utf-8"),
+            )
+            initial_log = (
+                result.session_directory / "iteration-01-candidate-01.compare.txt"
+            )
+            self.assertIn("REJECTED BEFORE BUILD", initial_log.read_text())
+            self.assertTrue(
+                (
+                    result.session_directory / "iteration-01-candidate-01-repair-01.c"
+                ).exists()
+            )
+
+
 class CompileRepairTests(unittest.TestCase):
     def test_support_file_failure_and_first_repair_can_self_repair(self) -> None:
         failing_candidate = """/* Function start: 0x401000 */

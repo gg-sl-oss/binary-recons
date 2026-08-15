@@ -8,7 +8,12 @@ from pathlib import Path
 from .llama_server import ManagedLlamaServer
 from .model_client import CandidateGenerator
 from .models import Candidate, LlamaServerConfig, SearchConfig, TargetSpec
-from .prompts import HistoryItem, build_compile_repair_prompt, build_prompt
+from .prompts import (
+    HistoryItem,
+    build_compile_repair_prompt,
+    build_prompt,
+    build_validation_repair_prompt,
+)
 from .repository import (
     ProjectRepository,
     candidate_fingerprint,
@@ -204,9 +209,10 @@ class ReconstructionSearch:
                             candidate = normalize_candidate_marker(
                                 proposed, self.target.address
                             )
+                            contract_locked = batch_contract.has_contract
                             candidate_target = (
                                 batch_contract
-                                if batch_contract.has_contract
+                                if contract_locked
                                 else self.target.with_candidate_contract(candidate)
                             )
                             fingerprint = candidate_fingerprint(candidate)
@@ -227,25 +233,126 @@ class ReconstructionSearch:
                             seen.add(fingerprint)
                             attempts += 1
 
-                            try:
-                                validate_candidate(
-                                    candidate,
-                                    candidate_target,
-                                    reserved_symbols,
-                                    allowed_support_paths,
-                                )
-                            except ValueError as error:
-                                feedback = "CANDIDATE REJECTED BEFORE BUILD: %s" % error
-                                run_log.write_candidate(
-                                    iteration, index, candidate, feedback
-                                )
-                                history.append(
-                                    HistoryItem(
-                                        fingerprint=fingerprint,
-                                        score=None,
-                                        candidate=candidate.model_dump_json(indent=2),
+                            repair_attempts_used = 0
+                            candidate_valid = False
+                            while True:
+                                try:
+                                    validate_candidate(
+                                        candidate,
+                                        candidate_target,
+                                        reserved_symbols,
+                                        allowed_support_paths,
                                     )
-                                )
+                                except ValueError as error:
+                                    feedback = (
+                                        "CANDIDATE REJECTED BEFORE BUILD: %s" % error
+                                    )
+                                    if repair_attempts_used == 0:
+                                        run_log.write_candidate(
+                                            iteration, index, candidate, feedback
+                                        )
+                                    else:
+                                        run_log.write_repair_candidate(
+                                            iteration,
+                                            index,
+                                            repair_attempts_used,
+                                            candidate,
+                                            feedback,
+                                        )
+                                    history.append(
+                                        HistoryItem(
+                                            fingerprint=fingerprint,
+                                            score=None,
+                                            candidate=candidate.model_dump_json(
+                                                indent=2
+                                            ),
+                                        )
+                                    )
+                                    if (
+                                        repair_attempts_used
+                                        >= self.config.compile_repair_attempts
+                                    ):
+                                        break
+
+                                    repair_attempt = repair_attempts_used + 1
+                                    repair_prompt = build_validation_repair_prompt(
+                                        batch_contract,
+                                        evidence,
+                                        self.config,
+                                        candidate,
+                                        feedback,
+                                        repair_attempt,
+                                    )
+                                    run_log.write_repair_prompt(
+                                        iteration,
+                                        index,
+                                        repair_attempt,
+                                        repair_prompt,
+                                    )
+                                    print(
+                                        "iteration %d candidate %d: requesting "
+                                        "validation repair %d/%d"
+                                        % (
+                                            iteration,
+                                            index,
+                                            repair_attempt,
+                                            self.config.compile_repair_attempts,
+                                        ),
+                                        flush=True,
+                                    )
+                                    repaired, repair_completion = generator.repair(
+                                        repair_prompt,
+                                        iteration,
+                                        index,
+                                        repair_attempt,
+                                    )
+                                    run_log.write_repair_generation(
+                                        iteration,
+                                        index,
+                                        repair_attempt,
+                                        repaired,
+                                        repair_completion,
+                                    )
+                                    repaired_candidate = normalize_candidate_marker(
+                                        repaired, self.target.address
+                                    )
+                                    repaired_fingerprint = candidate_fingerprint(
+                                        repaired_candidate
+                                    )
+                                    repair_attempts_used = repair_attempt
+                                    if repaired_fingerprint in seen:
+                                        feedback = (
+                                            "REPAIR SKIPPED: fingerprint already tried"
+                                        )
+                                        run_log.write_repair_candidate(
+                                            iteration,
+                                            index,
+                                            repair_attempt,
+                                            repaired_candidate,
+                                            feedback,
+                                        )
+                                        print(
+                                            "iteration %d candidate %d repair %d: "
+                                            "duplicate"
+                                            % (iteration, index, repair_attempt),
+                                            flush=True,
+                                        )
+                                        break
+                                    seen.add(repaired_fingerprint)
+                                    attempts += 1
+                                    candidate = repaired_candidate
+                                    fingerprint = repaired_fingerprint
+                                    if not contract_locked:
+                                        candidate_target = (
+                                            self.target.with_candidate_contract(
+                                                candidate
+                                            )
+                                        )
+                                    continue
+                                candidate_valid = True
+                                break
+
+                            if not candidate_valid:
                                 batch_results.append(_AttemptResult(None, feedback))
                                 print(
                                     "iteration %d candidate %d: rejected"
@@ -265,9 +372,18 @@ class ReconstructionSearch:
                             feedback = self.repository.compact_feedback(
                                 comparison, score
                             )
-                            run_log.write_candidate(
-                                iteration, index, candidate, comparison
-                            )
+                            if repair_attempts_used == 0:
+                                run_log.write_candidate(
+                                    iteration, index, candidate, comparison
+                                )
+                            else:
+                                run_log.write_repair_candidate(
+                                    iteration,
+                                    index,
+                                    repair_attempts_used,
+                                    candidate,
+                                    comparison,
+                                )
                             history.append(
                                 HistoryItem(
                                     fingerprint=fingerprint,
@@ -278,13 +394,15 @@ class ReconstructionSearch:
 
                             if (
                                 score is None
-                                and self.config.compile_repair_attempts > 0
+                                and self.config.compile_repair_attempts
+                                > repair_attempts_used
                                 and self.repository.is_repairable_build_failure(
                                     comparison
                                 )
                             ):
                                 for repair_attempt in range(
-                                    1, self.config.compile_repair_attempts + 1
+                                    repair_attempts_used + 1,
+                                    self.config.compile_repair_attempts + 1,
                                 ):
                                     repair_prompt = build_compile_repair_prompt(
                                         candidate_target,

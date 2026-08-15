@@ -145,10 +145,13 @@ address, and timestamp.
 Each model response is validated before it can replace source. The target
 definition, managed prototype, and all supporting insertions are applied as one
 transaction, compiled, compared, and then rolled back. Only the best complete
-workspace is retained. A build failure triggers a narrow repair request that
-receives only the failing change set, diagnostics, project rules, and allowed
-support-file context. Repairs may repair an earlier repair; the default limit
-is two calls, configurable with `--compile-repair-attempts` (or `0` to disable).
+workspace is retained. A pre-build validation rejection or build failure
+triggers a narrow repair request that receives only the failing change set,
+diagnostics, project rules, and allowed support-file context. For an unnamed
+target, this includes recovering from a collision with an existing function
+name without Python inventing a replacement. Repairs may repair an earlier
+repair; the default limit is two calls, configurable with `--repair-attempts`
+(`--compile-repair-attempts` remains an alias, and `0` disables repairs).
 
 Every normal candidate and repair is logged as both its function source and its
 full structured change set. `selected-change-set.json` records the exact
