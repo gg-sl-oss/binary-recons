@@ -43,7 +43,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     target.add_argument("--address", type=_integer, required=True)
     target.add_argument(
-        "--symbol", help="default: infer from the Ghidra assembly export"
+        "--symbol",
+        help="optional fixed symbol; default: model proposes one for new functions",
     )
     target.add_argument(
         "--source",
@@ -52,7 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     target.add_argument(
         "--prototype",
-        help="default: recover from configured declarations or existing source",
+        help="optional fixed prototype; default: model proposes one for new functions",
     )
 
     search = parser.add_argument_group("search")
@@ -170,7 +171,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     print(
         "target 0x%08X: %s -> %s"
-        % (target.address, target.symbol, target.source_display),
+        % (
+            target.address,
+            target.symbol or "<model-inferred contract>",
+            target.source_display,
+        ),
         flush=True,
     )
     result = ReconstructionSearch(repository, target, search_config, server_config).run(

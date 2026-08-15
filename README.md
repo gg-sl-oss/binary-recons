@@ -36,6 +36,7 @@ output_dir = "out/binary-recons"
 strings_file = "ghidra/strings.txt"
 source_dirs = ["src"]
 declaration_files = ["include/*.h"]
+prototype_file = "include/functions.h"
 rule_profiles = ["c89", "msvc4-od"]
 prompt_files = ["RECONSTRUCTION.md"]
 compare_command = ["make", "compare-func", "FUNC={symbol}", "ADDR={address_hex}"]
@@ -62,10 +63,17 @@ ghidra/FUN_00401000.decompiled.txt
 ```
 
 The assembly export should begin with `Function: <symbol>` when the source does
-not yet contain a definition. A declaration matching that symbol must exist in
-one of `declaration_files`, or `--prototype` must be supplied. Project-specific
-rules live in the configured prompt files and are included verbatim in each
-request.
+not yet contain a definition, but that export label is not treated as a source
+contract. For an unimplemented address, neither a name nor a prototype is put
+in the target contract: each structured candidate must infer and return a
+meaningful symbol, complete prototype, and matching definition from the raw
+evidence. The winning prototype is written to `prototype_file` with its address
+for use by later reconstructions. Existing definitions retain their established
+contract, and callers may still override it explicitly with `--symbol` and
+`--prototype`.
+
+Project-specific rules live in the configured prompt files and are included
+verbatim in each request.
 
 Reusable rules should not be copied into each target. Select packaged profiles
 with `rule_profiles`; the current profiles are `c89` and `msvc4-od`. Universal

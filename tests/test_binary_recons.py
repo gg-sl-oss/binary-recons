@@ -78,6 +78,7 @@ def make_fixture_project(root: Path) -> None:
         'strings_file = "analysis/strings.txt"\n'
         'source_dirs = ["src"]\n'
         'declaration_files = ["include/*.h"]\n'
+        'prototype_file = "include/functions.h"\n'
         'rule_profiles = ["c89"]\n'
         'prompt_files = ["RECONSTRUCTION.md"]\n'
         'compare_command = ["fixture-compare", "{symbol}", "{address_hex}"]\n'
@@ -104,7 +105,7 @@ def make_fixture_project(root: Path) -> None:
     write_fixture(
         root,
         "analysis/FUN_00401000.disassembled.txt",
-        "Function: sample_function\n"
+        "Function: FUN_00401000\n"
         "Address: 0x00401000\n\n"
         "MOV EAX,0x7\n"
         "PUSH 0x403000\n"
@@ -144,14 +145,14 @@ def wait_ready(port: int) -> None:
 
 
 class RepositoryTests(unittest.TestCase):
-    def test_target_is_inferred_from_explicit_project_root(self) -> None:
+    def test_new_target_contract_is_left_for_the_model(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             make_fixture_project(root)
             target = ProjectRepository(root).resolve_target(0x00401000)
-            self.assertEqual(target.symbol, "sample_function")
+            self.assertIsNone(target.symbol)
             self.assertEqual(target.source_path, (root / "src/sample.c").resolve())
-            self.assertEqual(target.prototype, "int sample_function(void)")
+            self.assertIsNone(target.prototype)
 
     def test_cli_dry_run_uses_project_root(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -181,6 +182,26 @@ class RepositoryTests(unittest.TestCase):
             self.assertIn("[shared profile: c89]", prompt)
             self.assertIn("[project file: RECONSTRUCTION.md]", prompt)
             self.assertIn('0x00403000: "fixture text"', prompt)
+            self.assertIn("No source-level name or interface is supplied", prompt)
+            self.assertNotIn("int sample_function(void)", prompt)
+
+    def test_existing_definition_keeps_its_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            make_fixture_project(root)
+            write_fixture(
+                root,
+                "src/sample.c",
+                """/* Function start: 0x401000 */
+int EstablishedName(void)
+{
+    return 7;
+}
+""",
+            )
+            target = ProjectRepository(root).resolve_target(0x00401000)
+            self.assertEqual(target.symbol, "EstablishedName")
+            self.assertEqual(target.prototype, "int EstablishedName(void)")
 
     def test_insertion_is_address_sorted(self) -> None:
         source = """/* Function start: 0x100 */
@@ -263,12 +284,18 @@ void OperationalLabel(void)
             repository = ProjectRepository(root)
             target = repository.resolve_target(0x00401000)
             self.assertEqual(
-                repository.config.comparison_command(target.symbol, target.address),
-                ["fixture-compare", "sample_function", "00401000"],
+                repository.config.comparison_command(
+                    "ComputeFixtureValue", target.address
+                ),
+                ["fixture-compare", "ComputeFixtureValue", "00401000"],
             )
 
     def test_candidate_schema_accepts_large_functions(self) -> None:
-        candidate = Candidate(source="x" * 6000)
+        candidate = Candidate(
+            symbol="ComputeFixtureValue",
+            prototype="int ComputeFixtureValue(void)",
+            source="x" * 6000,
+        )
         self.assertEqual(len(candidate.source), 6000)
 
     def test_compiler_errors_are_distinguished_from_compare_failures(self) -> None:
@@ -290,12 +317,12 @@ void OperationalLabel(void)
 class CompileRepairTests(unittest.TestCase):
     def test_compiler_failure_gets_one_focused_model_repair(self) -> None:
         failing_candidate = """/* Function start: 0x401000 */
-int sample_function(void)
+int ComputeFixtureValue(void)
 {
     return missing_value;
 }"""
         repaired_candidate = """/* Function start: 0x401000 */
-int sample_function(void)
+int ComputeFixtureValue(void)
 {
     return 7;
 }"""
@@ -321,7 +348,15 @@ int sample_function(void)
                 self, prompt: str, iteration: int
             ) -> tuple[CandidateBatch, dict[str, object]]:
                 return (
-                    CandidateBatch(candidates=[Candidate(source=failing_candidate)]),
+                    CandidateBatch(
+                        candidates=[
+                            Candidate(
+                                symbol="ComputeFixtureValue",
+                                prototype="int ComputeFixtureValue(void)",
+                                source=failing_candidate,
+                            )
+                        ]
+                    ),
                     {"kind": "initial"},
                 )
 
@@ -334,7 +369,11 @@ int sample_function(void)
             ) -> tuple[Candidate, dict[str, object]]:
                 self.repair_prompts.append(prompt)
                 type(self).repair_calls += 1
-                return Candidate(source=repaired_candidate), {"kind": "repair"}
+                return Candidate(
+                    symbol="ComputeFixtureValue",
+                    prototype="int ComputeFixtureValue(void)",
+                    source=repaired_candidate,
+                ), {"kind": "repair"}
 
             def close(self) -> None:
                 pass
@@ -377,10 +416,15 @@ int sample_function(void)
             self.assertTrue(result.target_reached)
             self.assertEqual(result.score, 100.0)
             self.assertEqual(result.attempts, 2)
+            self.assertEqual(result.symbol, "ComputeFixtureValue")
             self.assertEqual(FakeGenerator.repair_calls, 1)
             self.assertIn("missing_value", FakeGenerator.repair_prompts[0])
             self.assertIn("error C2065", FakeGenerator.repair_prompts[0])
             self.assertIn("return 7;", target.source_path.read_text(encoding="utf-8"))
+            self.assertIn(
+                "int ComputeFixtureValue(void); /* 0x00401000 */",
+                (root / "include/functions.h").read_text(encoding="utf-8"),
+            )
             repair_logs = list(result.session_directory.glob("*-repair-01.c"))
             self.assertEqual(len(repair_logs), 1)
 

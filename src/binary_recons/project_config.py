@@ -61,6 +61,7 @@ class ProjectConfig(BaseModel):
     strings_file: Path | None = None
     source_dirs: list[Path] = Field(default_factory=lambda: [Path("src")])
     declaration_files: list[str] = Field(default_factory=list)
+    prototype_file: Path | None = None
     rule_profiles: list[str] = Field(default_factory=list)
     prompt_files: list[Path] = Field(default_factory=list)
     compare_command: list[str] = Field(min_length=1)

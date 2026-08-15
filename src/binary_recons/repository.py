@@ -7,9 +7,9 @@ import re
 import subprocess
 from pathlib import Path
 
-from .models import MAX_CANDIDATE_CHARS, EvidenceBundle, TargetSpec
+from .models import MAX_CANDIDATE_CHARS, Candidate, EvidenceBundle, TargetSpec
 from .project_config import ProjectConfig, load_project_config
-from .utils import read_text
+from .utils import atomic_write, read_text
 
 
 MARKER_RE = re.compile(r"/\*\s*Function start:\s*0x([0-9A-Fa-f]+)\s*\*/")
@@ -106,23 +106,30 @@ def candidate_fingerprint(candidate: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
-def validate_candidate(candidate: str, target: TargetSpec) -> None:
+def validate_candidate(candidate: Candidate, target: TargetSpec) -> None:
+    source = candidate.source
     canonical_marker = "/* Function start: 0x%X */" % target.address
     errors: list[str] = []
-    if len(candidate) > MAX_CANDIDATE_CHARS:
+    if len(source) > MAX_CANDIDATE_CHARS:
         errors.append(
             "candidate is over the %d-character safety limit" % MAX_CANDIDATE_CHARS
         )
-    if candidate.count("Function start:") != 1:
+    if source.count("Function start:") != 1:
         errors.append("candidate must have exactly one Function start marker")
-    if canonical_marker not in candidate:
+    if canonical_marker not in source:
         errors.append("marker must be exactly %s" % canonical_marker)
-    if not re.search(r"\b%s\s*\(" % re.escape(target.symbol), candidate):
+    if target.symbol != candidate.symbol or target.prototype != candidate.prototype:
+        errors.append("candidate fields do not match the active target contract")
+    if not re.search(r"\b%s\s*\(" % re.escape(candidate.symbol), source):
         errors.append("candidate must define the target symbol")
+    if re.match(r"(?i)^(?:FUN|sub|function|fn)_?[0-9a-f]*$", candidate.symbol):
+        errors.append("candidate symbol must be a meaningful source-level name")
+    if "%X" % target.address in candidate.symbol.upper():
+        errors.append("candidate symbol must not contain the target address")
 
-    compact = re.sub(r"\s+", " ", candidate)
-    if re.sub(r"\s+", " ", target.prototype) not in compact:
-        errors.append("signature must be exactly: %s" % target.prototype)
+    compact = re.sub(r"\s+", " ", source)
+    if re.sub(r"\s+", " ", candidate.prototype) not in compact:
+        errors.append("signature must be exactly: %s" % candidate.prototype)
 
     forbidden = {
         "#include": "an include directive",
@@ -131,9 +138,9 @@ def validate_candidate(candidate: str, target: TargetSpec) -> None:
         "```": "a Markdown code fence",
     }
     for token, description in forbidden.items():
-        if token in candidate:
+        if token in source:
             errors.append("candidate contains %s" % description)
-    if candidate.count("{") != candidate.count("}"):
+    if source.count("{") != source.count("}"):
         errors.append("candidate braces are unbalanced")
     if errors:
         raise ValueError("; ".join(errors))
@@ -159,7 +166,6 @@ class ProjectRepository:
             if not path.exists():
                 raise RuntimeError("missing target export: %s" % path)
 
-        assembly = read_text(assembly_path)
         source_path = self._resolve_source(address, source)
         if not source_path.exists():
             raise RuntimeError("missing source unit: %s" % source_path)
@@ -168,24 +174,18 @@ class ProjectRepository:
 
         if symbol is None:
             symbol = definition_symbol(existing) if existing is not None else None
-        if symbol is None:
-            match = re.search(r"^Function:\s*([A-Za-z_]\w*)", assembly, re.M)
-            if match is not None:
-                symbol = match.group(1)
-        if symbol is None:
-            raise RuntimeError("could not infer target symbol from source or export")
 
-        if prototype is None:
+        if prototype is None and symbol is not None:
             for declaration_path in self.config.declarations(self.root):
                 prototype = declaration_for_symbol(read_text(declaration_path), symbol)
                 if prototype is not None:
                     break
-        if prototype is None and existing is not None:
+        if prototype is None and existing is not None and symbol is not None:
             prototype = definition_signature(existing, symbol)
-        if prototype is None:
+        if (symbol is None) != (prototype is None):
             raise RuntimeError(
-                "could not recover the target prototype; add it to a configured "
-                "declaration file or pass --prototype"
+                "target name and prototype must be supplied together, or both left "
+                "for model inference"
             )
 
         return TargetSpec(
@@ -228,10 +228,13 @@ class ProjectRepository:
             decompiler_hint=self._concise_decompilation(decompilation, target.symbol),
             string_evidence=self._string_evidence(assembly, decompilation),
             callee_evidence=self._callee_evidence(assembly, max_callees),
-            declaration_evidence=self._declaration_evidence(decompilation),
+            declaration_evidence=self._declaration_evidence(
+                decompilation,
+                excluded_address=None if target.has_contract else target.address,
+            ),
         )
 
-    def _concise_decompilation(self, text: str, symbol: str) -> str:
+    def _concise_decompilation(self, text: str, symbol: str | None) -> str:
         # The assembly export may carry a recovered developer name while the
         # decompiler export still carries its operational Ghidra label.  Find
         # the C definition by shape first so a name mismatch cannot discard the
@@ -244,9 +247,10 @@ class ProjectRepository:
         )
         if match is not None:
             return text[match.start() :].strip()[:6000]
-        match = re.search(r"^.*\b%s\s*\(" % re.escape(symbol), text, re.M)
-        if match is not None:
-            return text[match.start() :].strip()[:6000]
+        if symbol is not None:
+            match = re.search(r"^.*\b%s\s*\(" % re.escape(symbol), text, re.M)
+            if match is not None:
+                return text[match.start() :].strip()[:6000]
         return text.strip()[:6000]
 
     def _string_evidence(self, assembly: str, decompilation: str) -> str:
@@ -309,7 +313,11 @@ class ProjectRepository:
             else "No direct CALL targets were present."
         )
 
-    def _declaration_evidence(self, decompilation: str) -> str:
+    def _declaration_evidence(
+        self,
+        decompilation: str,
+        excluded_address: int | None = None,
+    ) -> str:
         paths = self.config.declarations(self.root)
         if not paths:
             return "No declaration files are configured for this target project."
@@ -370,6 +378,10 @@ class ProjectRepository:
                         r"(?i)(?<![0-9a-f])([0-9a-f]{6,8})(?![0-9a-f])", line
                     )
                 }
+                if excluded_address is not None and excluded_address in {
+                    int(token, 16) for token in line_addresses
+                }:
+                    continue
                 if not direct_matches and not (address_tokens & line_addresses):
                     continue
                 try:
@@ -421,6 +433,8 @@ class ProjectRepository:
         return "\n".join(evidence)[:12000]
 
     def compare(self, target: TargetSpec, timeout: float) -> tuple[float | None, str]:
+        if target.symbol is None:
+            raise RuntimeError("cannot compare a target without a proposed symbol")
         command = self.config.comparison_command(target.symbol, target.address)
         try:
             result = subprocess.run(
@@ -439,6 +453,45 @@ class ProjectRepository:
         match = SIMILARITY_RE.search(result.stdout)
         score = float(match.group(1)) if match is not None else None
         return score, result.stdout
+
+    def persist_contract(self, target: TargetSpec) -> None:
+        """Write a winning model-proposed prototype to the configured header."""
+
+        if not target.has_contract or self.config.prototype_file is None:
+            return
+        assert target.symbol is not None
+        assert target.prototype is not None
+        path = self.config.resolve(self.root, self.config.prototype_file)
+        if not path.exists():
+            raise RuntimeError("missing configured prototype file: %s" % path)
+
+        lines = read_text(path).splitlines()
+        declaration = "%s; /* 0x%08X */" % (target.prototype, target.address)
+        address_pattern = re.compile(r"(?i)0x0*%x\b" % target.address)
+        for index, line in enumerate(lines):
+            if address_pattern.search(line):
+                lines[index] = declaration
+                atomic_write(path, "\n".join(lines) + "\n")
+                return
+        if any(
+            re.search(r"\b%s\s*\(" % re.escape(target.symbol), line) for line in lines
+        ):
+            return
+
+        insertion = next(
+            (
+                index
+                for index, line in enumerate(lines)
+                if (match := re.search(r"(?i)0x([0-9a-f]{6,8})", line))
+                and int(match.group(1), 16) > target.address
+            ),
+            next(
+                (index for index, line in enumerate(lines) if line.strip() == "#endif"),
+                len(lines),
+            ),
+        )
+        lines.insert(insertion, declaration)
+        atomic_write(path, "\n".join(lines) + "\n")
 
     @staticmethod
     def compact_feedback(output: str, score: float | None) -> str:

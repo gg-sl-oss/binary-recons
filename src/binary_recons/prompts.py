@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .models import EvidenceBundle, SearchConfig, TargetSpec
+from .models import Candidate, EvidenceBundle, SearchConfig, TargetSpec
 
 
 SYSTEM_PROMPT = """\
@@ -46,6 +46,19 @@ def build_prompt(
 ) -> str:
     current = best_candidate if best_candidate is not None else "<not implemented>"
     last_result = feedback if feedback else "No candidate has been compiled yet."
+    if target.has_contract:
+        contract = f"""\
+- Existing symbol: {target.symbol}
+- Existing signature: {target.prototype}
+- Preserve that symbol, signature, and calling convention in every candidate."""
+    else:
+        contract = """\
+- No source-level name or interface is supplied for this unimplemented target.
+- Infer a concise, meaningful function name and complete prototype from the raw
+  assembly, decompiler hint, callers/callees, strings, and declarations.
+- Do not use a Ghidra label, address, generic placeholder, or mechanism-only
+  name. Each candidate's symbol and prototype fields must exactly describe its
+  source definition."""
     roles = [
         "- Candidate 1 must isolate a declaration/order/lifetime hypothesis. "
         "When values occupy different registers or stack slots, vary only meaningful "
@@ -69,14 +82,15 @@ source definitions in the structured candidates field.
 
 TARGET CONTRACT
 - Marker: /* Function start: 0x{target.address:X} */
-- Signature: {target.prototype}
-- Define only {target.symbol}; include no declarations or surrounding file text.
+{contract}
+- Define only the proposed target; include no declarations or surrounding file
+  text.
 
 TARGET PROJECT
 - Language: {evidence.language}
 - Compiler/toolchain: {evidence.compiler}
 - Original assembly below is the only authority. Decompiled C is a hint.
-- Preserve the exact signature and calling convention.
+- Return structured symbol, prototype, and source fields for every candidate.
 - Define only the target function, with no includes, declarations, helpers,
   surrounding file text, Markdown, placeholders, or unrelated edits.
 - Use only identifiers supported by the supplied project/declaration evidence.
@@ -129,7 +143,7 @@ def build_compile_repair_prompt(
     target: TargetSpec,
     evidence: EvidenceBundle,
     config: SearchConfig,
-    candidate: str,
+    candidate: Candidate,
     compiler_feedback: str,
     repair_attempt: int,
 ) -> str:
@@ -147,8 +161,12 @@ REPAIR PASS
 
 TARGET CONTRACT
 - Marker: /* Function start: 0x{target.address:X} */
-- Signature: {target.prototype}
-- Define only {target.symbol}; include no declarations or surrounding file text.
+- Symbol: {candidate.symbol}
+- Signature: {candidate.prototype}
+- Preserve the proposed name and interface unless a compiler diagnostic proves
+  that the interface is not accepted.
+- Return symbol, prototype, and source fields that agree exactly.
+- Define only the target; include no declarations or surrounding file text.
 
 COMPILATION CONSTRAINTS
 - Language: {evidence.language}
@@ -167,5 +185,5 @@ MECHANICALLY DISCOVERED REFERENCED DECLARATIONS
 {evidence.declaration_evidence}
 
 FAILING C DEFINITION
-{candidate}
+{candidate.source}
 """

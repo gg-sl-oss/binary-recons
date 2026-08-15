@@ -7,7 +7,7 @@ from pathlib import Path
 
 from .llama_server import ManagedLlamaServer
 from .model_client import CandidateGenerator
-from .models import LlamaServerConfig, SearchConfig, TargetSpec
+from .models import Candidate, LlamaServerConfig, SearchConfig, TargetSpec
 from .prompts import HistoryItem, build_compile_repair_prompt, build_prompt
 from .repository import (
     ProjectRepository,
@@ -26,6 +26,8 @@ class SearchResult:
     target_reached: bool
     attempts: int
     session_directory: Path
+    symbol: str | None = None
+    prototype: str | None = None
 
 
 @dataclass(frozen=True)
@@ -49,16 +51,17 @@ class ReconstructionSearch:
 
     def _compile_candidate(
         self,
-        candidate: str,
+        candidate: Candidate,
+        candidate_target: TargetSpec,
         best_source: str,
     ) -> tuple[str, float | None, str]:
         trial_source = replace_or_insert_function(
-            best_source, self.target.address, candidate
+            best_source, self.target.address, candidate.source
         )
         atomic_write(self.target.source_path, trial_source)
         try:
             score, comparison = self.repository.compare(
-                self.target, self.config.build_timeout
+                candidate_target, self.config.build_timeout
             )
         finally:
             atomic_write(self.target.source_path, best_source)
@@ -75,6 +78,7 @@ class ReconstructionSearch:
         original_source = read_text(self.target.source_path)
         best_source = original_source
         best_candidate = current_function(original_source, self.target.address)
+        best_target = self.target
         best_score = -1.0
         best_feedback = ""
         history: list[HistoryItem] = []
@@ -108,6 +112,8 @@ class ReconstructionSearch:
                             target_reached=True,
                             attempts=0,
                             session_directory=run_log.directory,
+                            symbol=best_target.symbol,
+                            prototype=best_target.prototype,
                         )
                         run_log.update_manifest(
                             status="complete",
@@ -116,6 +122,8 @@ class ReconstructionSearch:
                                 "score": result.score,
                                 "target_reached": True,
                                 "attempts": 0,
+                                "symbol": best_target.symbol,
+                                "prototype": best_target.prototype,
                             },
                         )
                         print("target already meets %.2f%%" % self.config.target_score)
@@ -139,6 +147,8 @@ class ReconstructionSearch:
                     target_reached=False,
                     attempts=0,
                     session_directory=run_log.directory,
+                    symbol=best_target.symbol,
+                    prototype=best_target.prototype,
                 )
 
             server = ManagedLlamaServer(
@@ -149,7 +159,7 @@ class ReconstructionSearch:
                 try:
                     for iteration in range(1, self.config.max_iterations + 1):
                         prompt = build_prompt(
-                            self.target,
+                            best_target,
                             evidence,
                             self.config,
                             best_candidate,
@@ -171,18 +181,24 @@ class ReconstructionSearch:
 
                         batch_results: list[_AttemptResult] = []
                         target_reached = False
+                        batch_contract = best_target
                         candidates = batch.candidates[
                             : self.config.candidates_per_iteration
                         ]
                         for index, proposed in enumerate(candidates, 1):
-                            candidate = proposed.source
-                            fingerprint = candidate_fingerprint(candidate)
+                            candidate = proposed
+                            candidate_target = (
+                                batch_contract
+                                if batch_contract.has_contract
+                                else self.target.with_candidate_contract(candidate)
+                            )
+                            fingerprint = candidate_fingerprint(candidate.source)
                             if fingerprint in seen:
                                 feedback = (
                                     "CANDIDATE SKIPPED: fingerprint already tried"
                                 )
                                 run_log.write_candidate(
-                                    iteration, index, candidate, feedback
+                                    iteration, index, candidate.source, feedback
                                 )
                                 batch_results.append(_AttemptResult(None, feedback))
                                 print(
@@ -195,17 +211,17 @@ class ReconstructionSearch:
                             attempts += 1
 
                             try:
-                                validate_candidate(candidate, self.target)
+                                validate_candidate(candidate, candidate_target)
                             except ValueError as error:
                                 feedback = "CANDIDATE REJECTED BEFORE BUILD: %s" % error
                                 run_log.write_candidate(
-                                    iteration, index, candidate, feedback
+                                    iteration, index, candidate.source, feedback
                                 )
                                 history.append(
                                     HistoryItem(
                                         fingerprint=fingerprint,
                                         score=None,
-                                        candidate=candidate,
+                                        candidate=candidate.source,
                                     )
                                 )
                                 batch_results.append(_AttemptResult(None, feedback))
@@ -217,19 +233,19 @@ class ReconstructionSearch:
                                 continue
 
                             trial_source, score, comparison = self._compile_candidate(
-                                candidate, best_source
+                                candidate, candidate_target, best_source
                             )
                             feedback = self.repository.compact_feedback(
                                 comparison, score
                             )
                             run_log.write_candidate(
-                                iteration, index, candidate, comparison
+                                iteration, index, candidate.source, comparison
                             )
                             history.append(
                                 HistoryItem(
                                     fingerprint=fingerprint,
                                     score=score,
-                                    candidate=candidate,
+                                    candidate=candidate.source,
                                 )
                             )
 
@@ -242,7 +258,7 @@ class ReconstructionSearch:
                                     1, self.config.compile_repair_attempts + 1
                                 ):
                                     repair_prompt = build_compile_repair_prompt(
-                                        self.target,
+                                        candidate_target,
                                         evidence,
                                         self.config,
                                         candidate,
@@ -280,9 +296,9 @@ class ReconstructionSearch:
                                         repair_completion,
                                     )
 
-                                    repaired_candidate = repaired.source
+                                    repaired_candidate = repaired
                                     repaired_fingerprint = candidate_fingerprint(
-                                        repaired_candidate
+                                        repaired_candidate.source
                                     )
                                     if repaired_fingerprint in seen:
                                         feedback = (
@@ -292,7 +308,7 @@ class ReconstructionSearch:
                                             iteration,
                                             index,
                                             repair_attempt,
-                                            repaired_candidate,
+                                            repaired_candidate.source,
                                             feedback,
                                         )
                                         print(
@@ -308,7 +324,7 @@ class ReconstructionSearch:
                                     candidate = repaired_candidate
                                     fingerprint = repaired_fingerprint
                                     try:
-                                        validate_candidate(candidate, self.target)
+                                        validate_candidate(candidate, candidate_target)
                                     except ValueError as error:
                                         score = None
                                         feedback = (
@@ -318,14 +334,14 @@ class ReconstructionSearch:
                                             iteration,
                                             index,
                                             repair_attempt,
-                                            candidate,
+                                            candidate.source,
                                             feedback,
                                         )
                                         history.append(
                                             HistoryItem(
                                                 fingerprint=fingerprint,
                                                 score=None,
-                                                candidate=candidate,
+                                                candidate=candidate.source,
                                             )
                                         )
                                         print(
@@ -337,7 +353,9 @@ class ReconstructionSearch:
                                         continue
 
                                     trial_source, score, comparison = (
-                                        self._compile_candidate(candidate, best_source)
+                                        self._compile_candidate(
+                                            candidate, candidate_target, best_source
+                                        )
                                     )
                                     feedback = self.repository.compact_feedback(
                                         comparison, score
@@ -346,14 +364,14 @@ class ReconstructionSearch:
                                         iteration,
                                         index,
                                         repair_attempt,
-                                        candidate,
+                                        candidate.source,
                                         comparison,
                                     )
                                     history.append(
                                         HistoryItem(
                                             fingerprint=fingerprint,
                                             score=score,
-                                            candidate=candidate,
+                                            candidate=candidate.source,
                                         )
                                     )
                                     if score is not None:
@@ -397,7 +415,8 @@ class ReconstructionSearch:
                             if score > best_score:
                                 best_score = score
                                 best_source = trial_source
-                                best_candidate = candidate
+                                best_candidate = candidate.source
+                                best_target = candidate_target
                                 best_feedback = feedback
                                 atomic_write(self.target.source_path, best_source)
                             if best_score >= self.config.target_score:
@@ -435,16 +454,26 @@ class ReconstructionSearch:
                                 target_reached=True,
                                 attempts=attempts,
                                 session_directory=run_log.directory,
+                                symbol=best_target.symbol,
+                                prototype=best_target.prototype,
                             )
+                            self.repository.persist_contract(best_target)
                             run_log.update_manifest(
                                 status="complete",
                                 result={
                                     "score": best_score,
                                     "target_reached": True,
                                     "attempts": attempts,
+                                    "symbol": best_target.symbol,
+                                    "prototype": best_target.prototype,
                                 },
                             )
                             print("target reached: %.2f%%" % best_score, flush=True)
+                            print(
+                                "selected contract: %s — %s"
+                                % (best_target.symbol, best_target.prototype),
+                                flush=True,
+                            )
                             print("logs: %s" % run_log.directory)
                             return result
                 finally:
@@ -456,13 +485,19 @@ class ReconstructionSearch:
                 target_reached=False,
                 attempts=attempts,
                 session_directory=run_log.directory,
+                symbol=best_target.symbol,
+                prototype=best_target.prototype,
             )
+            if score is not None:
+                self.repository.persist_contract(best_target)
             run_log.update_manifest(
                 status="complete" if score is not None else "failed",
                 result={
                     "score": score,
                     "target_reached": False,
                     "attempts": attempts,
+                    "symbol": best_target.symbol,
+                    "prototype": best_target.prototype,
                 },
             )
             if score is None:
@@ -472,6 +507,11 @@ class ReconstructionSearch:
                 )
             else:
                 print("best retained similarity: %.2f%%" % score)
+                print(
+                    "selected contract: %s — %s"
+                    % (best_target.symbol, best_target.prototype),
+                    flush=True,
+                )
             print("logs: %s" % run_log.directory)
             return result
         except BaseException as error:

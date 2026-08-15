@@ -8,7 +8,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 MODEL_ENVIRONMENT_VARIABLE = "BINARY_RECONS_MODEL_PATH"
@@ -41,6 +41,17 @@ class Candidate(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    symbol: str = Field(
+        min_length=3,
+        max_length=100,
+        pattern=r"^[A-Za-z_][A-Za-z0-9_]*$",
+        description="Descriptive source-level function name without an address.",
+    )
+    prototype: str = Field(
+        min_length=6,
+        max_length=1000,
+        description="Complete function signature without a trailing semicolon.",
+    )
     source: str = Field(
         min_length=20,
         max_length=MAX_CANDIDATE_CHARS,
@@ -54,6 +65,17 @@ class Candidate(BaseModel):
     @classmethod
     def strip_source(cls, value: str) -> str:
         return value.strip()
+
+    @field_validator("prototype")
+    @classmethod
+    def strip_prototype(cls, value: str) -> str:
+        return value.strip().rstrip(";").strip()
+
+    @model_validator(mode="after")
+    def contract_agrees(self) -> "Candidate":
+        if self.symbol not in self.prototype:
+            raise ValueError("prototype does not contain the proposed symbol")
+        return self
 
 
 class CandidateBatch(BaseModel):
@@ -69,9 +91,9 @@ class TargetSpec(BaseModel):
 
     root: Path
     address: int
-    symbol: str
+    symbol: str | None
     source_path: Path
-    prototype: str
+    prototype: str | None
     assembly_path: Path
     decompiled_path: Path
 
@@ -81,6 +103,15 @@ class TargetSpec(BaseModel):
             return str(self.source_path.relative_to(self.root))
         except ValueError:
             return str(self.source_path)
+
+    @property
+    def has_contract(self) -> bool:
+        return self.symbol is not None and self.prototype is not None
+
+    def with_candidate_contract(self, candidate: Candidate) -> "TargetSpec":
+        return self.model_copy(
+            update={"symbol": candidate.symbol, "prototype": candidate.prototype}
+        )
 
 
 class EvidenceBundle(BaseModel):
