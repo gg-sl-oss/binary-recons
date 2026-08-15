@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "binary-recons"
+version = "0.1.0"
+description = "Local-LLM source reconstruction with compiler feedback"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "GPL-3.0-only"
+license-files = ["LICENSE"]
+dependencies = [
+    "httpx>=0.28,<1",
+    "instructor==1.15.4",
+    "openai>=2.0,<3",
+    "pydantic>=2.8,<3",
+]
+
+[project.scripts]
+binary-recons = "binary_recons.cli:entrypoint"
+
+[project.optional-dependencies]
+dev = ["ruff>=0.12"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+target-version = "py311"
