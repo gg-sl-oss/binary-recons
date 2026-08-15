@@ -203,6 +203,26 @@ void second(void)
         self.assertLess(updated.index("0x200"), updated.index("0x300"))
         self.assertEqual(current_function(updated, 0x200), candidate.rstrip())
 
+    def test_replacing_last_function_does_not_add_blank_line_at_eof(self) -> None:
+        source = """/* Function start: 0x100 */
+void before(void)
+{
+}
+
+/* Function start: 0x200 */
+void target(void)
+{
+}
+"""
+        candidate = """/* Function start: 0x200 */
+void target(void)
+{
+    work();
+}"""
+        updated = replace_or_insert_function(source, 0x200, candidate)
+        self.assertTrue(updated.endswith("    work();\n}\n"))
+        self.assertFalse(updated.endswith("\n\n"))
+
     def test_decompilation_extraction_does_not_require_matching_name(self) -> None:
         decompilation = """Function: OperationalLabel
 Address: 0x00401000

@@ -85,7 +85,8 @@ def replace_or_insert_function(source: str, address: int, candidate: str) -> str
     if span is not None:
         start, end = span
         tail = source[end:].lstrip("\n")
-        return source[:start].rstrip("\n") + "\n\n" + candidate.rstrip() + "\n\n" + tail
+        updated = source[:start].rstrip("\n") + "\n\n" + candidate.rstrip()
+        return updated + ("\n\n" + tail if tail else "\n")
 
     for marker in MARKER_RE.finditer(source):
         if int(marker.group(1), 16) > address:
