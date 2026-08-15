@@ -19,8 +19,9 @@ from unittest.mock import patch
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
 
-from binary_recons.cli import main  # noqa: E402
+from binary_recons.cli import entrypoint, main  # noqa: E402
 from binary_recons.llama_server import ManagedLlamaServer  # noqa: E402
+from binary_recons.model_client import ModelRequestError  # noqa: E402
 from binary_recons.models import (  # noqa: E402
     Candidate,
     CandidateBatch,
@@ -176,6 +177,20 @@ def wait_ready(port: int) -> None:
 
 
 class RepositoryTests(unittest.TestCase):
+    def test_model_request_failure_has_a_concise_cli_error(self) -> None:
+        stderr = io.StringIO()
+        with (
+            patch(
+                "binary_recons.cli.main",
+                side_effect=ModelRequestError("Request timed out."),
+            ),
+            contextlib.redirect_stderr(stderr),
+        ):
+            result = entrypoint()
+
+        self.assertEqual(result, 1)
+        self.assertEqual(stderr.getvalue(), "binary-recons: Request timed out.\n")
+
     def test_new_target_contract_is_left_for_the_model(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

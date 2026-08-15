@@ -8,6 +8,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
+from .model_client import ModelRequestError
 from .models import (
     DEFAULT_MODEL_PATH,
     LlamaServerConfig,
@@ -207,7 +208,7 @@ def main(argv: list[str] | None = None) -> int:
 def entrypoint() -> int:
     try:
         return main()
-    except (RuntimeError, OSError, ValidationError) as error:
+    except (RuntimeError, OSError, ValidationError, ModelRequestError) as error:
         print("binary-recons: %s" % error, file=sys.stderr)
         return 1
     except KeyboardInterrupt:

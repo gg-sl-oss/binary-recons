@@ -5,7 +5,8 @@ from __future__ import annotations
 from typing import Any
 
 import instructor
-from openai import OpenAI
+from instructor.core.exceptions import InstructorRetryException
+from openai import OpenAI, OpenAIError
 from pydantic import BaseModel
 
 from .llama_server import ManagedLlamaServer
@@ -17,6 +18,10 @@ from .models import (
     SymbolProposalBatch,
 )
 from .prompts import SYSTEM_PROMPT
+
+
+class ModelRequestError(RuntimeError):
+    """A bounded model request failed without producing validated output."""
 
 
 class CandidateGenerator:
@@ -99,20 +104,25 @@ class CandidateGenerator:
             }
         elif self.config.thinking:
             extra_body["reasoning_effort"] = self.config.reasoning_effort
-        batch, completion = self._instructor.chat.completions.create_with_completion(
-            model=self.config.model,
-            response_model=response_model,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            max_retries=self.config.format_retries,
-            max_tokens=max_tokens or self.config.max_tokens,
-            temperature=self.config.effective_temperature(preset),
-            top_p=self.config.effective_top_p(preset),
-            presence_penalty=self.config.effective_presence_penalty(preset),
-            seed=seed,
-            extra_body=extra_body,
-        )
+        try:
+            batch, completion = (
+                self._instructor.chat.completions.create_with_completion(
+                    model=self.config.model,
+                    response_model=response_model,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt},
+                    ],
+                    max_retries=self.config.format_retries,
+                    max_tokens=max_tokens or self.config.max_tokens,
+                    temperature=self.config.effective_temperature(preset),
+                    top_p=self.config.effective_top_p(preset),
+                    presence_penalty=self.config.effective_presence_penalty(preset),
+                    seed=seed,
+                    extra_body=extra_body,
+                )
+            )
+        except (InstructorRetryException, OpenAIError) as error:
+            raise ModelRequestError(str(error)) from error
         self.server.ensure_alive()
         return batch, completion

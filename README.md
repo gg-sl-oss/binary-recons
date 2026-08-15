@@ -146,7 +146,8 @@ binary-recons --project-root /path/to/target --address 0x401000 \
 
 Use `--dry-run-prompt` to inspect all collected evidence without loading a
 model. Runs are recorded under the configured `output_dir`, grouped by model,
-address, and timestamp.
+address, and timestamp. Model timeouts and exhausted structured-output retries
+are recorded there and reported as one concise CLI error.
 
 Each model response is validated before it can replace source. The target
 definition, managed prototype, and all supporting insertions are applied as one
