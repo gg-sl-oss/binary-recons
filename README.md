@@ -3,63 +3,100 @@
 [![CI](https://github.com/gg-sl-oss/binary-recons/actions/workflows/ci.yml/badge.svg)](https://github.com/gg-sl-oss/binary-recons/actions/workflows/ci.yml)
 
 `binary-recons` runs a bounded generate, compile, and assembly-compare loop for
-recovering C source with a local Qwen model. Python controls every repository
-edit and `binary-comp` comparison; the model receives structured evidence and
-never receives shell or filesystem tools.
+recovering one source function at a time with a local language model. Python
+owns repository edits and comparisons; the model receives a structured prompt
+and never receives shell or filesystem tools.
 
-The first project adapter expects the Wing Commander reconstruction layout:
-Ghidra exports in `code-full/`, declarations in `include/`, compilation-unit
-ranges in `docs/ORDER.md`, and `make compare-func FUNC=<name>`.
+Target-specific layout, compiler details, reconstruction rules, and comparison
+commands belong in the target repository. The Python package contains no
+conventions for a particular binary or source tree.
 
 ## Install
 
-Python 3.11+, `llama-server`, and the Qwen3.8 27B GGUF are required.
+Python 3.11+ is required. Managed model serving also requires `llama-server`.
 
 ```sh
 python3 -m pip install -e /path/to/binary-recons
 ```
 
-The command discovers the Unsloth Hugging Face cache automatically. Override
-the model when needed:
+The installed `binary-recons` command can be invoked from any directory. CI and
+the unit tests use a synthetic HTTP server, so installing or downloading a
+model is not required to test the package.
 
-```sh
-export BINARY_RECONS_MODEL_PATH=/path/to/Qwen3.8-27B-BF16-00001-of-00002.gguf
+## Configure a target project
+
+Create `binary-recons.toml` at the target repository root:
+
+```toml
+schema_version = 1
+language = "C"
+compiler = "Microsoft Visual C++ 4.20"
+exports_dir = "ghidra"
+output_dir = "out/binary-recons"
+source_dirs = ["src"]
+declaration_files = ["include/*.h"]
+prompt_files = ["RECONSTRUCTION.md"]
+compare_command = ["make", "compare-func", "FUNC={symbol}", "ADDR={address_hex}"]
+
+[[source_units]]
+path = "src/game.c"
+start = 0x00401000
+end = 0x0040ffff
 ```
+
+The comparison command may use `{symbol}`, `{address}`, and `{address_hex}`.
+It must compile the current source and print a `Similarity: N%` line from the
+project's comparison authority.
+
+Assembly and decompiler exports use these names by default:
+
+```text
+ghidra/FUN_00401000.disassembled.txt
+ghidra/FUN_00401000.decompiled.txt
+```
+
+The assembly export should begin with `Function: <symbol>` when the source does
+not yet contain a definition. A declaration matching that symbol must exist in
+one of `declaration_files`, or `--prototype` must be supplied. Project-specific
+rules live in the configured prompt files and are included verbatim in each
+request.
 
 ## Run
 
-Run from a reconstruction repository; the current directory is the default
-project root:
+Set a GGUF once, then run against any configured project:
 
 ```sh
-cd /path/to/wc1-test
-binary-recons --address 0x418210
+export BINARY_RECONS_MODEL_PATH=/models/model.gguf
+binary-recons --project-root /path/to/target --address 0x401000
 ```
 
-Or provide the repository explicitly:
+`--model-preset auto` identifies Qwen and Gemma from the alias or filename.
+Explicit presets are useful when the filename is ambiguous:
 
 ```sh
-binary-recons --project-root /path/to/wc1-test --address 0x418210
+binary-recons --project-root /path/to/target --address 0x401000 \
+  --model-path /models/gemma-4.gguf --model-preset gemma
 ```
 
-Managed mode starts one `llama-server`, waits for its health endpoint, records
-its PID and logs, and stops only that owned process group on exit. To reuse a
-server started elsewhere, opt into non-owning mode:
+The Gemma preset uses Gemma's recommended sampling defaults. The Qwen preset
+adds llama.cpp's Qwen MTP speculative-decoding flags. CLI sampling options
+override either preset.
+
+Managed mode starts one `llama-server`, monitors it, records its PID and logs,
+and stops only that owned process group on exit. To reuse an already-running
+server without taking ownership of it:
 
 ```sh
-binary-recons --address 0x418210 --server-mode external
+binary-recons --project-root /path/to/target --address 0x401000 \
+  --server-mode external
 ```
 
-Use `--dry-run-prompt` to collect evidence and inspect the prompt without
-loading Qwen. Runs are recorded under
-`out/qwen-reconstruct/<address>/<timestamp>/` in the target repository.
+Use `--dry-run-prompt` to inspect all collected evidence without loading a
+model. Runs are recorded under the configured `output_dir`, grouped by model,
+address, and timestamp.
 
-When a candidate reaches the compiler but fails with a compiler or linker
-diagnostic, the driver immediately makes one focused Qwen repair request using
-the failing definition, diagnostics, and central declaration evidence. This is
-bounded separately from the main search with `--compile-repair-attempts`
-(default `1`; use `0` to disable it). Repair prompts, completions, source, and
-compiler output are recorded beside the normal iteration logs.
-
-The test suite and GitHub CI use a synthetic HTTP server and require neither a
-local model nor `llama-server`.
+Each model response is validated before it can replace source. Candidates are
+compiled and compared one at a time, and only the best result is retained. If a
+candidate reaches the compiler but has compiler errors, a separately bounded
+repair request receives the failing definition and diagnostics. Set
+`--compile-repair-attempts 0` to disable that step.

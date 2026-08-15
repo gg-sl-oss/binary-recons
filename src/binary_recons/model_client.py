@@ -8,7 +8,7 @@ import instructor
 from openai import OpenAI
 
 from .llama_server import ManagedLlamaServer
-from .models import Candidate, CandidateBatch, SearchConfig
+from .models import Candidate, CandidateBatch, ModelPreset, SearchConfig
 from .prompts import SYSTEM_PROMPT
 
 
@@ -60,16 +60,20 @@ class CandidateGenerator:
         seed: int,
     ) -> tuple[Any, Any]:
         self.server.ensure_alive()
+        preset = self.server.config.resolved_preset()
         extra_body = {
-            "top_k": self.config.top_k,
+            "top_k": self.config.effective_top_k(preset),
             "min_p": self.config.min_p,
             "repeat_penalty": self.config.repeat_penalty,
             "cache_prompt": True,
-            "reasoning_effort": self.config.reasoning_effort,
-            "chat_template_kwargs": {
-                "enable_thinking": self.config.thinking,
-            },
         }
+        if preset in (ModelPreset.QWEN, ModelPreset.GEMMA):
+            extra_body["reasoning_effort"] = self.config.reasoning_effort
+            extra_body["chat_template_kwargs"] = {
+                "enable_thinking": self.config.thinking,
+            }
+        elif self.config.thinking:
+            extra_body["reasoning_effort"] = self.config.reasoning_effort
         batch, completion = self._instructor.chat.completions.create_with_completion(
             model=self.config.model,
             response_model=response_model,
@@ -79,9 +83,9 @@ class CandidateGenerator:
             ],
             max_retries=self.config.format_retries,
             max_tokens=self.config.max_tokens,
-            temperature=self.config.effective_temperature,
-            top_p=self.config.effective_top_p,
-            presence_penalty=self.config.effective_presence_penalty,
+            temperature=self.config.effective_temperature(preset),
+            top_p=self.config.effective_top_p(preset),
+            presence_penalty=self.config.effective_presence_penalty(preset),
             seed=seed,
             extra_body=extra_body,
         )

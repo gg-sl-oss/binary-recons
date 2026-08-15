@@ -8,6 +8,7 @@ import subprocess
 from pathlib import Path
 
 from .models import MAX_CANDIDATE_CHARS, EvidenceBundle, TargetSpec
+from .project_config import ProjectConfig, load_project_config
 from .utils import read_text
 
 
@@ -19,6 +20,7 @@ COMPILER_ERROR_RE = re.compile(
     r":\s*error:)",
     re.I | re.M,
 )
+SOURCE_SUFFIXES = frozenset({".c", ".cc", ".cpp", ".cxx"})
 
 
 def declaration_for_symbol(text: str, symbol: str) -> str | None:
@@ -37,6 +39,27 @@ def declaration_for_symbol(text: str, symbol: str) -> str | None:
     )
     declaration = re.sub(r"\s+", " ", declaration).strip()
     return declaration or None
+
+
+def definition_signature(text: str, symbol: str) -> str | None:
+    match = re.search(
+        r"^.*\b%s\s*\([^;{}]*\)\s*\{" % re.escape(symbol), text, re.M | re.S
+    )
+    if match is None:
+        return None
+    signature = match.group(0).rsplit("{", 1)[0]
+    signature = re.sub(r"/\*.*?\*/", " ", signature, flags=re.S)
+    signature = re.sub(r"//[^\n]*", " ", signature)
+    return re.sub(r"\s+", " ", signature).strip() or None
+
+
+def definition_symbol(text: str) -> str | None:
+    match = re.search(
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\([^;{}]*\)\s*\{",
+        text,
+        re.S,
+    )
+    return match.group(1) if match is not None else None
 
 
 def function_span(source: str, address: int) -> tuple[int, int] | None:
@@ -93,17 +116,14 @@ def validate_candidate(candidate: str, target: TargetSpec) -> None:
         errors.append("candidate must have exactly one Function start marker")
     if canonical_marker not in candidate:
         errors.append("marker must be exactly %s" % canonical_marker)
-    if candidate.count(target.symbol) != 1:
-        errors.append("candidate must define the target symbol exactly once")
+    if not re.search(r"\b%s\s*\(" % re.escape(target.symbol), candidate):
+        errors.append("candidate must define the target symbol")
 
     compact = re.sub(r"\s+", " ", candidate)
     if re.sub(r"\s+", " ", target.prototype) not in compact:
         errors.append("signature must be exactly: %s" % target.prototype)
 
     forbidden = {
-        "__asm": "inline assembly",
-        "__declspec(naked)": "a naked function",
-        "this->": "this->",
         "#include": "an include directive",
         "#define": "a preprocessor definition",
         "extern ": "an extern declaration",
@@ -112,19 +132,16 @@ def validate_candidate(candidate: str, target: TargetSpec) -> None:
     for token, description in forbidden.items():
         if token in candidate:
             errors.append("candidate contains %s" % description)
-    if re.search(r"\b(?:try|catch|__finally)\b", candidate):
-        errors.append("candidate contains forbidden exception handling")
     if candidate.count("{") != candidate.count("}"):
         errors.append("candidate braces are unbalanced")
-    if re.search(r"\{\s*(?:return|[A-Za-z_]\w*\s*=)[^\n]*\}", candidate):
-        errors.append("candidate puts the function body on one line")
     if errors:
         raise ValueError("; ".join(errors))
 
 
 class ProjectRepository:
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, config_path: Path | None = None):
         self.root = root.resolve()
+        self.config: ProjectConfig = load_project_config(self.root, config_path)
 
     def resolve_target(
         self,
@@ -134,37 +151,41 @@ class ProjectRepository:
         prototype: str | None = None,
     ) -> TargetSpec:
         stem = "FUN_%08X" % address
-        assembly_path = self.root / "code-full" / (stem + ".disassembled.txt")
-        decompiled_path = self.root / "code-full" / (stem + ".decompiled.txt")
+        exports = self.config.resolve(self.root, self.config.exports_dir)
+        assembly_path = exports / (stem + ".disassembled.txt")
+        decompiled_path = exports / (stem + ".decompiled.txt")
         for path in (assembly_path, decompiled_path):
             if not path.exists():
                 raise RuntimeError("missing target export: %s" % path)
 
         assembly = read_text(assembly_path)
-        if symbol is None:
-            match = re.search(r"^Function:\s*([A-Za-z_]\w*)", assembly, re.M)
-            if match is None:
-                raise RuntimeError(
-                    "could not infer target symbol from %s" % assembly_path
-                )
-            symbol = match.group(1)
-
-        implemented_path = self.root / "include/wc1funcs.h"
-        external_path = self.root / "include/wc1extern.h"
-        implemented = read_text(implemented_path)
-        external = read_text(external_path)
-        if not re.search(r"\b%s\s*\(" % re.escape(symbol), implemented):
-            raise RuntimeError("target is not declared in include/wc1funcs.h")
-        if re.search(r"\b%s\s*\(" % re.escape(symbol), external):
-            raise RuntimeError("target is still declared in include/wc1extern.h")
-        if prototype is None:
-            prototype = declaration_for_symbol(implemented, symbol)
-        if prototype is None:
-            raise RuntimeError("could not recover the target prototype")
-
         source_path = self._resolve_source(address, source)
         if not source_path.exists():
             raise RuntimeError("missing source unit: %s" % source_path)
+        source_text = read_text(source_path)
+        existing = current_function(source_text, address)
+
+        if symbol is None:
+            symbol = definition_symbol(existing) if existing is not None else None
+        if symbol is None:
+            match = re.search(r"^Function:\s*([A-Za-z_]\w*)", assembly, re.M)
+            if match is not None:
+                symbol = match.group(1)
+        if symbol is None:
+            raise RuntimeError("could not infer target symbol from source or export")
+
+        if prototype is None:
+            for declaration_path in self.config.declarations(self.root):
+                prototype = declaration_for_symbol(read_text(declaration_path), symbol)
+                if prototype is not None:
+                    break
+        if prototype is None and existing is not None:
+            prototype = definition_signature(existing, symbol)
+        if prototype is None:
+            raise RuntimeError(
+                "could not recover the target prototype; add it to a configured "
+                "declaration file or pass --prototype"
+            )
 
         return TargetSpec(
             root=self.root,
@@ -179,25 +200,29 @@ class ProjectRepository:
     def _resolve_source(self, address: int, source: Path | None) -> Path:
         if source is not None:
             return source if source.is_absolute() else self.root / source
-        order = read_text(self.root / "docs/ORDER.md")
-        pattern = re.compile(
-            r"\|\s*`(?P<path>src/[^`]+)`\s*\|\s*"
-            r"`0x(?P<start>[0-9A-Fa-f]+)`\s*[–-]\s*"
-            r"`0x(?P<end>[0-9A-Fa-f]+)`"
-        )
-        for match in pattern.finditer(order):
-            start = int(match.group("start"), 16)
-            end = int(match.group("end"), 16)
-            if start <= address <= end:
-                return self.root / match.group("path")
+        canonical_marker = "/* Function start: 0x%X */" % address
+        for directory in self.config.source_paths(self.root):
+            if not directory.exists():
+                continue
+            for path in sorted(directory.rglob("*")):
+                if path.is_file() and path.suffix.lower() in SOURCE_SUFFIXES:
+                    if canonical_marker in read_text(path):
+                        return path
+        for unit in self.config.source_units:
+            if unit.start <= address <= unit.end:
+                return self.config.resolve(self.root, unit.path)
         raise RuntimeError(
-            "could not infer a source unit for 0x%08X from docs/ORDER.md" % address
+            "could not infer a source unit for 0x%08X; add a source_units range "
+            "or pass --source" % address
         )
 
     def collect_evidence(self, target: TargetSpec, max_callees: int) -> EvidenceBundle:
         assembly = read_text(target.assembly_path)
         decompilation = read_text(target.decompiled_path)
         return EvidenceBundle(
+            language=self.config.language,
+            compiler=self.config.compiler,
+            project_guidance=self.config.guidance(self.root),
             original_assembly=assembly.strip(),
             decompiler_hint=self._concise_decompilation(decompilation, target.symbol),
             callee_evidence=self._callee_evidence(assembly, max_callees),
@@ -228,13 +253,11 @@ class ProjectRepository:
             address = int(raw, 16)
             if address not in addresses:
                 addresses.append(address)
-        headers = [
-            read_text(self.root / "include/wc1funcs.h"),
-            read_text(self.root / "include/wc1extern.h"),
-        ]
+        headers = [read_text(path) for path in self.config.declarations(self.root)]
         evidence: list[str] = []
+        exports = self.config.resolve(self.root, self.config.exports_dir)
         for address in addresses[:max_callees]:
-            path = self.root / "code-full" / ("FUN_%08X.disassembled.txt" % address)
+            path = exports / ("FUN_%08X.disassembled.txt" % address)
             if not path.exists():
                 evidence.append("CALL 0x%08X: no developer export available" % address)
                 continue
@@ -261,117 +284,118 @@ class ProjectRepository:
         )
 
     def _declaration_evidence(self, decompilation: str) -> str:
-        headers = sorted((self.root / "include").glob("*.h"))
-        header_lines = [(path, read_text(path).splitlines()) for path in headers]
-        declarations_by_address: dict[str, list[tuple[Path, int, str]]] = {}
-        for path, lines in header_lines:
-            for line_number, line in enumerate(lines, 1):
-                for declared in re.findall(
-                    r"\b(?:g_[A-Za-z_][A-Za-z0-9_]*|DAT_[0-9A-Fa-f]+)\b",
-                    line,
-                ):
-                    address_match = re.search(r"_([0-9A-Fa-f]{8})$", declared)
-                    if address_match is None:
-                        continue
-                    declarations_by_address.setdefault(
-                        address_match.group(1).lower(), []
-                    ).append((path, line_number, line.strip()))
-        identifiers = list(
-            dict.fromkeys(
-                re.findall(
-                    r"\b(?:g_[A-Za-z_][A-Za-z0-9_]*|DAT_[0-9A-Fa-f]+)\b",
-                    decompilation,
-                )
-            )
+        paths = self.config.declarations(self.root)
+        if not paths:
+            return "No declaration files are configured for this target project."
+
+        ignored = {
+            "auto",
+            "break",
+            "case",
+            "char",
+            "const",
+            "continue",
+            "default",
+            "do",
+            "double",
+            "else",
+            "enum",
+            "extern",
+            "float",
+            "for",
+            "goto",
+            "if",
+            "int",
+            "long",
+            "register",
+            "return",
+            "short",
+            "signed",
+            "sizeof",
+            "static",
+            "struct",
+            "switch",
+            "typedef",
+            "union",
+            "unsigned",
+            "void",
+            "volatile",
+            "while",
+        }
+        identifiers = (
+            set(re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", decompilation)) - ignored
         )
-        fields = list(
-            dict.fromkeys(
-                re.findall(r"(?:\.|->)([A-Za-z_][A-Za-z0-9_]*)", decompilation)
-            )
-        )
+        fields = set(re.findall(r"(?:\.|->)([A-Za-z_][A-Za-z0-9_]*)", decompilation))
+        address_tokens = {
+            match.group(1).lower()
+            for identifier in identifiers
+            if (match := re.search(r"_([0-9A-Fa-f]{6,8})$", identifier))
+        }
+
         evidence: list[str] = []
-        matched_declarations: list[str] = []
-
-        for identifier in identifiers:
-            found = False
-            for path, lines in header_lines:
-                for line_number, line in enumerate(lines, 1):
-                    if re.search(r"\b%s\b" % re.escape(identifier), line):
-                        matched_declarations.append(line)
-                        evidence.append(
-                            "%s:%d: %s"
-                            % (
-                                path.relative_to(self.root),
-                                line_number,
-                                line.strip(),
-                            )
-                        )
-                        found = True
-                        break
-                if found:
-                    break
-            if not found:
-                address_match = re.search(r"_([0-9A-Fa-f]{8})$", identifier)
-                address_matches = []
-                if address_match is not None:
-                    address_matches = declarations_by_address.get(
-                        address_match.group(1).lower(), []
+        matched_lines: list[str] = []
+        for path in paths:
+            for line_number, line in enumerate(read_text(path).splitlines(), 1):
+                line_identifiers = set(re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", line))
+                direct_matches = identifiers & line_identifiers
+                line_addresses = {
+                    token.lower()
+                    for token in re.findall(
+                        r"(?i)(?<![0-9a-f])([0-9a-f]{6,8})(?![0-9a-f])", line
                     )
-                if address_matches:
-                    for path, line_number, line in address_matches[:3]:
-                        matched_declarations.append(line)
-                        evidence.append(
-                            "Address-matched central declaration for %s: %s:%d: %s"
-                            % (
-                                identifier,
-                                path.relative_to(self.root),
-                                line_number,
-                                line,
-                            )
-                        )
-                else:
-                    evidence.append("No central declaration found for %s" % identifier)
+                }
+                if not direct_matches and not (address_tokens & line_addresses):
+                    continue
+                try:
+                    display = path.relative_to(self.root)
+                except ValueError:
+                    display = path
+                stripped = line.strip()
+                evidence.append("%s:%d: %s" % (display, line_number, stripped))
+                matched_lines.append(stripped)
 
-        for field in fields:
-            found = False
-            for path, lines in header_lines:
-                for line_number, line in enumerate(lines, 1):
-                    if re.search(r"\b%s\b" % re.escape(field), line) and ";" in line:
-                        evidence.append(
-                            "%s:%d member: %s"
-                            % (
-                                path.relative_to(self.root),
-                                line_number,
-                                line.strip(),
-                            )
-                        )
-                        found = True
-                        break
-                if found:
-                    break
-
-        declaration_text = "\n".join(matched_declarations)
-        for path in headers:
+        declaration_text = "\n".join(matched_lines)
+        for path in paths:
             header = read_text(path)
             for match in re.finditer(
-                r"typedef\s+struct\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{"
-                r".*?\}\s*\1\s*;",
+                r"typedef\s+struct(?:\s+[A-Za-z_][A-Za-z0-9_]*)?\s*\{"
+                r".*?\}\s*([A-Za-z_][A-Za-z0-9_]*)\s*;",
                 header,
                 re.S,
             ):
                 type_name = match.group(1)
                 if re.search(r"\b%s\b" % re.escape(type_name), declaration_text):
+                    try:
+                        display = path.relative_to(self.root)
+                    except ValueError:
+                        display = path
                     evidence.append(
                         "%s relevant type definition:\n%s"
-                        % (path.relative_to(self.root), match.group(0).strip())
+                        % (display, match.group(0).strip())
                     )
 
+        unresolved = sorted(
+            identifier
+            for identifier in identifiers
+            if re.search(r"_[0-9A-Fa-f]{6,8}$", identifier)
+            and not any(
+                re.search(r"\b%s\b" % re.escape(identifier), line)
+                for line in matched_lines
+            )
+        )
+        if unresolved:
+            evidence.append(
+                "Decompiler identifiers with no exact configured declaration: %s"
+                % ", ".join(unresolved[:40])
+            )
+        if fields and not evidence:
+            evidence.append("Referenced members: %s" % ", ".join(sorted(fields)))
         if not evidence:
-            return "No named global or member references were present."
+            return "No configured declarations matched this decompilation."
         return "\n".join(evidence)[:12000]
 
     def compare(self, target: TargetSpec, timeout: float) -> tuple[float | None, str]:
-        command = ["make", "compare-func", "FUNC=" + target.symbol]
+        command = self.config.comparison_command(target.symbol, target.address)
         try:
             result = subprocess.run(
                 command,

@@ -92,13 +92,11 @@ class ManagedLlamaServer:
                 raise RuntimeError("llama-server binary does not exist: %s" % binary)
             if self.config.model_path is None:
                 raise RuntimeError(
-                    "no Qwen model found; pass --model-path or set "
+                    "no model configured; pass --model-path or set "
                     "BINARY_RECONS_MODEL_PATH"
                 )
             if not self.config.model_path.exists():
-                raise RuntimeError(
-                    "Qwen model does not exist: %s" % self.config.model_path
-                )
+                raise RuntimeError("model does not exist: %s" % self.config.model_path)
 
         command = self.config.command(self.search)
         self._log_handle = self.log_path.open("w", encoding="utf-8", buffering=1)

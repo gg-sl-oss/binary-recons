@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+import re
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
@@ -12,11 +13,11 @@ from .utils import atomic_write, utc_now, write_json
 
 
 class RunLog:
-    def __init__(self, root: Path, target: TargetSpec, config: SearchConfig):
+    def __init__(self, output_root: Path, target: TargetSpec, config: SearchConfig):
         stamp = time.strftime("%Y%m%d-%H%M%S")
-        self.directory = (
-            root / "out/qwen-reconstruct" / ("%08X" % target.address) / stamp
-        )
+        model_name = re.sub(r"[^A-Za-z0-9._-]+", "-", config.model).strip("-.")
+        model_name = model_name[:80] or "local-model"
+        self.directory = output_root / model_name / ("%08X" % target.address) / stamp
         self.directory.mkdir(parents=True, exist_ok=False)
         self._started_monotonic = time.monotonic()
         self._manifest: dict[str, Any] = {

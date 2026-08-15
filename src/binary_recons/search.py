@@ -68,7 +68,10 @@ class ReconstructionSearch:
         evidence = self.repository.collect_evidence(
             self.target, self.config.max_callees
         )
-        run_log = RunLog(self.repository.root, self.target, self.config)
+        output_root = self.repository.config.resolve(
+            self.repository.root, self.repository.config.output_dir
+        )
+        run_log = RunLog(output_root, self.target, self.config)
         original_source = read_text(self.target.source_path)
         best_source = original_source
         best_candidate = current_function(original_source, self.target.address)
@@ -155,8 +158,12 @@ class ReconstructionSearch:
                         )
                         run_log.write_prompt(iteration, prompt)
                         print(
-                            "iteration %d/%d: requesting Qwen"
-                            % (iteration, self.config.max_iterations),
+                            "iteration %d/%d: requesting %s"
+                            % (
+                                iteration,
+                                self.config.max_iterations,
+                                self.config.model,
+                            ),
                             flush=True,
                         )
                         batch, completion = generator.generate(prompt, iteration)

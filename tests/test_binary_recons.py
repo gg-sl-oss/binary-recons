@@ -25,6 +25,7 @@ from binary_recons.models import (  # noqa: E402
     Candidate,
     CandidateBatch,
     LlamaServerConfig,
+    ModelPreset,
     SearchConfig,
     ServerMode,
 )
@@ -69,16 +70,28 @@ def write_fixture(root: Path, relative: str, content: str) -> None:
 def make_fixture_project(root: Path) -> None:
     write_fixture(
         root,
-        "docs/ORDER.md",
-        "| `src/sample.c` | `0x401000`–`0x4010FF` | fixture |\n",
+        "binary-recons.toml",
+        'language = "C"\n'
+        'compiler = "Fixture Compiler 1.0"\n'
+        'exports_dir = "analysis"\n'
+        'output_dir = "artifacts/reconstruction"\n'
+        'source_dirs = ["src"]\n'
+        'declaration_files = ["include/*.h"]\n'
+        'prompt_files = ["RECONSTRUCTION.md"]\n'
+        'compare_command = ["fixture-compare", "{symbol}", "{address_hex}"]\n'
+        "\n"
+        "[[source_units]]\n"
+        'path = "src/sample.c"\n'
+        "start = 0x401000\n"
+        "end = 0x4010ff\n",
     )
+    write_fixture(root, "RECONSTRUCTION.md", "Use portable fixture source.\n")
     write_fixture(root, "src/sample.c", '#include "project.h"\n')
     write_fixture(
         root,
-        "include/wc1funcs.h",
+        "include/functions.h",
         "int sample_function(void); /* 0x00401000 */\n",
     )
-    write_fixture(root, "include/wc1extern.h", "")
     write_fixture(
         root,
         "include/globals.h",
@@ -87,7 +100,7 @@ def make_fixture_project(root: Path) -> None:
     )
     write_fixture(
         root,
-        "code-full/FUN_00401000.disassembled.txt",
+        "analysis/FUN_00401000.disassembled.txt",
         "Function: sample_function\n"
         "Address: 0x00401000\n\n"
         "MOV EAX,0x7\n"
@@ -96,7 +109,7 @@ def make_fixture_project(root: Path) -> None:
     )
     write_fixture(
         root,
-        "code-full/FUN_00401000.decompiled.txt",
+        "analysis/FUN_00401000.decompiled.txt",
         "Function: FUN_00401000\n"
         "Address: 0x00401000\n\n"
         "int FUN_00401000(void)\n\n"
@@ -155,7 +168,7 @@ class RepositoryTests(unittest.TestCase):
                 )
             self.assertEqual(result, 0)
             prompts = list(
-                (root / "out/qwen-reconstruct/00401000").glob(
+                (root / "artifacts/reconstruction/local-model/00401000").glob(
                     "*/iteration-01.prompt.txt"
                 )
             )
@@ -193,9 +206,11 @@ void OperationalLabel(void)
   first_statement();
   last_statement();
 }
-"""
+        """
         with tempfile.TemporaryDirectory() as temporary:
-            hint = ProjectRepository(Path(temporary))._concise_decompilation(
+            root = Path(temporary)
+            make_fixture_project(root)
+            hint = ProjectRepository(root)._concise_decompilation(
                 decompilation, "RecoveredDeveloperName"
             )
         self.assertTrue(hint.startswith("void OperationalLabel(void)"))
@@ -212,6 +227,17 @@ void OperationalLabel(void)
             )
         self.assertIn("g_sample_value_00402010", evidence)
         self.assertIn("g_sample_vector_00402020", evidence)
+
+    def test_comparison_command_is_project_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            make_fixture_project(root)
+            repository = ProjectRepository(root)
+            target = repository.resolve_target(0x00401000)
+            self.assertEqual(
+                repository.config.comparison_command(target.symbol, target.address),
+                ["fixture-compare", "sample_function", "00401000"],
+            )
 
     def test_candidate_schema_accepts_large_functions(self) -> None:
         candidate = Candidate(source="x" * 6000)
@@ -409,6 +435,29 @@ class LlamaServerTests(unittest.TestCase):
             manifest = json.loads((directory / "llama-server.json").read_text())
             self.assertEqual(manifest["status"], "stopped")
             self.assertEqual(manifest["stop_reason"], "exception")
+
+    def test_model_presets_keep_qwen_flags_out_of_gemma(self) -> None:
+        search = SearchConfig(seed=1, max_iterations=1)
+        qwen = LlamaServerConfig(
+            model_path=Path("qwen.gguf"),
+            preset=ModelPreset.QWEN,
+        )
+        gemma = LlamaServerConfig(
+            model_path=Path("gemma.gguf"),
+            preset=ModelPreset.GEMMA,
+        )
+        qwen_command = qwen.command(search)
+        gemma_command = gemma.command(search)
+        self.assertIn("draft-mtp", qwen_command)
+        self.assertNotIn("draft-mtp", gemma_command)
+        self.assertEqual(
+            gemma_command[gemma_command.index("--top-k") + 1],
+            "64",
+        )
+        self.assertEqual(
+            gemma_command[gemma_command.index("--temp") + 1],
+            "1.0",
+        )
 
 
 if __name__ == "__main__":

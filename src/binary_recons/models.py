@@ -12,20 +12,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 MODEL_ENVIRONMENT_VARIABLE = "BINARY_RECONS_MODEL_PATH"
-MODEL_FILENAME = "Qwen3.8-27B-BF16-00001-of-00002.gguf"
 
 
 def discover_default_model_path() -> Path | None:
     configured = os.environ.get(MODEL_ENVIRONMENT_VARIABLE)
-    if configured:
-        return Path(configured).expanduser()
-    snapshots = (
-        Path.home()
-        / ".cache/huggingface/hub"
-        / "models--unsloth--Qwen3.8-27B-GGUF/snapshots"
-    )
-    candidates = sorted(snapshots.glob("*/BF16/%s" % MODEL_FILENAME))
-    return candidates[-1] if candidates else None
+    return Path(configured).expanduser() if configured else None
 
 
 DEFAULT_MODEL_PATH = discover_default_model_path()
@@ -38,8 +29,15 @@ class ServerMode(str, Enum):
     EXTERNAL = "external"
 
 
+class ModelPreset(str, Enum):
+    AUTO = "auto"
+    GENERIC = "generic"
+    QWEN = "qwen"
+    GEMMA = "gemma"
+
+
 class Candidate(BaseModel):
-    """One complete C definition proposed by the model."""
+    """One complete source definition proposed by the model."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -47,7 +45,7 @@ class Candidate(BaseModel):
         min_length=20,
         max_length=MAX_CANDIDATE_CHARS,
         description=(
-            "Complete target C definition, including its Function start marker; "
+            "Complete target definition, including its Function start marker; "
             "no Markdown or explanation."
         ),
     )
@@ -86,6 +84,9 @@ class TargetSpec(BaseModel):
 
 
 class EvidenceBundle(BaseModel):
+    language: str
+    compiler: str
+    project_guidance: str
     original_assembly: str
     decompiler_hint: str
     callee_evidence: str
@@ -95,7 +96,7 @@ class EvidenceBundle(BaseModel):
 class SearchConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    model: str = "qwen3.8-27b"
+    model: str = "local-model"
     max_iterations: int = Field(default=3, ge=1, le=20)
     candidates_per_iteration: int = Field(default=3, ge=1, le=8)
     target_score: float = Field(default=80.0, ge=0.0, le=100.0)
@@ -110,7 +111,7 @@ class SearchConfig(BaseModel):
     seed: int
     temperature: float | None = Field(default=None, ge=0.0, le=2.0)
     top_p: float | None = Field(default=None, gt=0.0, le=1.0)
-    top_k: int = Field(default=20, ge=0)
+    top_k: int | None = Field(default=None, ge=0)
     min_p: float = Field(default=0.0, ge=0.0, le=1.0)
     presence_penalty: float | None = Field(default=None, ge=-2.0, le=2.0)
     repeat_penalty: float = Field(default=1.0, gt=0.0)
@@ -119,23 +120,37 @@ class SearchConfig(BaseModel):
     def thinking(self) -> bool:
         return self.reasoning_effort != "none"
 
-    @property
-    def effective_temperature(self) -> float:
+    def effective_temperature(self, preset: ModelPreset) -> float:
         if self.temperature is not None:
             return self.temperature
+        if preset == ModelPreset.GEMMA:
+            return 1.0
         return 1.0 if self.thinking else 0.7
 
-    @property
-    def effective_top_p(self) -> float:
+    def effective_top_p(self, preset: ModelPreset) -> float:
         if self.top_p is not None:
             return self.top_p
+        if preset == ModelPreset.GEMMA:
+            return 0.95
         return 0.95 if self.thinking else 0.80
 
-    @property
-    def effective_presence_penalty(self) -> float:
+    def effective_top_k(self, preset: ModelPreset) -> int:
+        if self.top_k is not None:
+            return self.top_k
+        if preset == ModelPreset.GEMMA:
+            return 64
+        if preset == ModelPreset.QWEN:
+            return 20
+        return 40
+
+    def effective_presence_penalty(self, preset: ModelPreset) -> float:
         if self.presence_penalty is not None:
             return self.presence_penalty
-        return 0.0 if self.thinking else 1.5
+        if preset == ModelPreset.GEMMA:
+            return 0.0
+        if preset == ModelPreset.QWEN:
+            return 0.0 if self.thinking else 1.5
+        return 0.0
 
 
 class LlamaServerConfig(BaseModel):
@@ -144,7 +159,8 @@ class LlamaServerConfig(BaseModel):
     mode: ServerMode = ServerMode.MANAGED
     binary: Path | None = None
     model_path: Path | None = DEFAULT_MODEL_PATH
-    alias: str = "qwen3.8-27b"
+    alias: str = "local-model"
+    preset: ModelPreset = ModelPreset.AUTO
     host: str = "127.0.0.1"
     port: int = Field(default=8080, ge=1, le=65535)
     context_size: int = Field(default=16384, ge=2048)
@@ -171,13 +187,27 @@ class LlamaServerConfig(BaseModel):
             )
         return Path(discovered)
 
+    def resolved_preset(self) -> ModelPreset:
+        if self.preset != ModelPreset.AUTO:
+            return self.preset
+        identity = self.alias
+        if self.model_path is not None:
+            identity += " " + self.model_path.name
+        identity = identity.lower()
+        if "qwen" in identity:
+            return ModelPreset.QWEN
+        if "gemma" in identity:
+            return ModelPreset.GEMMA
+        return ModelPreset.GENERIC
+
     def command(self, search: SearchConfig) -> list[str]:
         if self.command_override is not None:
             return list(self.command_override)
         if self.model_path is None:
             raise RuntimeError(
-                "no Qwen model found; pass --model-path or set BINARY_RECONS_MODEL_PATH"
+                "no model configured; pass --model-path or set BINARY_RECONS_MODEL_PATH"
             )
+        preset = self.resolved_preset()
         command = [
             str(self.resolved_binary()),
             "-m",
@@ -204,29 +234,34 @@ class LlamaServerConfig(BaseModel):
             "q8_0",
             "--cache-type-v",
             "q8_0",
-            "--spec-type",
-            "draft-mtp",
-            "--spec-draft-n-max",
-            "2",
-            "--spec-draft-ngl",
-            "all",
-            "--spec-draft-type-k",
-            "q4_0",
-            "--spec-draft-type-v",
-            "q4_0",
             "--temp",
-            str(search.effective_temperature),
+            str(search.effective_temperature(preset)),
             "--top-p",
-            str(search.effective_top_p),
+            str(search.effective_top_p(preset)),
             "--top-k",
-            str(search.top_k),
+            str(search.effective_top_k(preset)),
             "--min-p",
             str(search.min_p),
             "--presence-penalty",
-            str(search.effective_presence_penalty),
+            str(search.effective_presence_penalty(preset)),
             "--repeat-penalty",
             str(search.repeat_penalty),
             "--jinja",
             "--metrics",
         ]
+        if preset == ModelPreset.QWEN:
+            command.extend(
+                [
+                    "--spec-type",
+                    "draft-mtp",
+                    "--spec-draft-n-max",
+                    "2",
+                    "--spec-draft-ngl",
+                    "all",
+                    "--spec-draft-type-k",
+                    "q4_0",
+                    "--spec-draft-type-v",
+                    "q4_0",
+                ]
+            )
         return command

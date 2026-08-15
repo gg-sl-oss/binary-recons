@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "binary-recons"
 version = "0.1.0"
-description = "Local-LLM source reconstruction with compiler feedback"
+description = "Project-configured local-LLM binary source reconstruction"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "GPL-3.0-only"
