@@ -29,12 +29,14 @@ from binary_recons.models import (  # noqa: E402
     SearchConfig,
     ServerMode,
     SupportingInsertion,
+    SymbolProposalBatch,
 )
 from binary_recons.repository import (  # noqa: E402
     ProjectRepository,
     candidate_fingerprint,
     current_function,
     normalize_candidate_marker,
+    rename_candidate_symbol,
     replace_or_insert_function,
     validate_candidate,
 )
@@ -347,6 +349,33 @@ void OperationalLabel(void)
             normalized.source.startswith("/* Function start: 0x401000 */\n")
         )
 
+    def test_model_proposed_symbol_is_applied_only_to_candidate_contract(self) -> None:
+        candidate = Candidate(
+            symbol="ExistingHelper",
+            prototype="void ExistingHelper(void)",
+            source="""/* Function start: 0x401000 */
+void ExistingHelper(void)
+{
+    ExistingHelper();
+}""",
+            supporting_insertions=[
+                SupportingInsertion(
+                    path="include/globals.h",
+                    content="extern int g_ExistingHelperCount;",
+                )
+            ],
+        )
+
+        renamed = rename_candidate_symbol(candidate, "ComputeFixtureValue")
+
+        self.assertEqual(renamed.symbol, "ComputeFixtureValue")
+        self.assertEqual(renamed.prototype, "void ComputeFixtureValue(void)")
+        self.assertEqual(renamed.source.count("ComputeFixtureValue"), 2)
+        self.assertEqual(
+            renamed.supporting_insertions[0].content,
+            "extern int g_ExistingHelperCount;",
+        )
+
     def test_complete_change_set_renders_support_and_prototype_together(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -508,15 +537,6 @@ void ExistingHelper(void)
 {
 }""",
         )
-        repaired = Candidate(
-            symbol="ComputeFixtureValue",
-            prototype="int ComputeFixtureValue(void)",
-            source="""/* Function start: 0x401000 */
-int ComputeFixtureValue(void)
-{
-    return 7;
-}""",
-        )
 
         class FakeServer:
             def __init__(self, *args: object):
@@ -539,15 +559,27 @@ int ComputeFixtureValue(void)
             ) -> tuple[CandidateBatch, dict[str, object]]:
                 return CandidateBatch(candidates=[rejected]), {}
 
-            def repair(
+            def propose_symbols(
                 self,
                 prompt: str,
                 iteration: int,
                 candidate_index: int,
                 repair_attempt: int,
-            ) -> tuple[Candidate, dict[str, object]]:
+            ) -> tuple[SymbolProposalBatch, dict[str, object]]:
                 self.repair_prompts.append(prompt)
-                return repaired, {}
+                return (
+                    SymbolProposalBatch(
+                        symbols=[
+                            "ExistingHelper",
+                            "ComputeFixtureValue",
+                            "EvaluateFixtureState",
+                        ]
+                    ),
+                    {},
+                )
+
+            def repair(self, *args: object) -> None:
+                raise AssertionError("full candidate repair should not be requested")
 
             def close(self) -> None:
                 pass
@@ -560,7 +592,7 @@ int ComputeFixtureValue(void)
 
             def compare_candidate(*args: object) -> tuple[float | None, str]:
                 source = target.source_path.read_text(encoding="utf-8")
-                self.assertIn("int ComputeFixtureValue(void)", source)
+                self.assertIn("void ComputeFixtureValue(void)", source)
                 self.assertNotIn("void ExistingHelper(void)\n{", source)
                 return 100.0, "Similarity: 100.00%"
 
@@ -591,12 +623,10 @@ int ComputeFixtureValue(void)
                 "candidate symbol is already used",
                 FakeGenerator.repair_prompts[0],
             )
-            self.assertIn(
-                "You may replace the proposed symbol", FakeGenerator.repair_prompts[0]
-            )
+            self.assertIn("naming task only", FakeGenerator.repair_prompts[0])
             self.assertIn("ExistingHelper", FakeGenerator.repair_prompts[0])
             self.assertIn(
-                "int ComputeFixtureValue(void); /* 0x00401000 */",
+                "void ComputeFixtureValue(void); /* 0x00401000 */",
                 (root / "include/functions.h").read_text(encoding="utf-8"),
             )
             initial_log = (
@@ -605,7 +635,8 @@ int ComputeFixtureValue(void)
             self.assertIn("REJECTED BEFORE BUILD", initial_log.read_text())
             self.assertTrue(
                 (
-                    result.session_directory / "iteration-01-candidate-01-repair-01.c"
+                    result.session_directory
+                    / "iteration-01-candidate-01-repair-01.symbols.json"
                 ).exists()
             )
 

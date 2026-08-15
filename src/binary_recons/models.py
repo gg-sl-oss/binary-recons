@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 from enum import Enum
 from pathlib import Path
@@ -119,6 +120,33 @@ class CandidateBatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     candidates: list[Candidate] = Field(min_length=1, max_length=8)
+
+
+class SymbolProposalBatch(BaseModel):
+    """Diverse model-proposed names for a candidate with a colliding symbol."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    symbols: list[str] = Field(
+        min_length=3,
+        max_length=8,
+        description=(
+            "Distinct, meaningful C identifiers ordered from strongest to weakest."
+        ),
+    )
+
+    @field_validator("symbols")
+    @classmethod
+    def validate_symbols(cls, values: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        for value in values:
+            value = value.strip()
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{2,99}", value):
+                raise ValueError("every proposed symbol must be a valid C identifier")
+            if value in cleaned:
+                raise ValueError("proposed symbols must be distinct")
+            cleaned.append(value)
+        return cleaned
 
 
 class TargetSpec(BaseModel):

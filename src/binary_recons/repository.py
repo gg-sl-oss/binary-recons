@@ -140,6 +140,22 @@ def normalize_candidate_marker(candidate: Candidate, address: int) -> Candidate:
     return candidate.model_copy(update={"source": source})
 
 
+def rename_candidate_symbol(candidate: Candidate, symbol: str) -> Candidate:
+    """Apply a model-proposed identifier to only the candidate's own contract."""
+
+    pattern = r"\b%s\b" % re.escape(candidate.symbol)
+    prototype, prototype_replacements = re.subn(pattern, symbol, candidate.prototype)
+    source, source_replacements = re.subn(pattern, symbol, candidate.source)
+    if prototype_replacements == 0 or source_replacements == 0:
+        raise ValueError("candidate contract does not contain its current symbol")
+    return Candidate(
+        symbol=symbol,
+        prototype=prototype,
+        source=source,
+        supporting_insertions=candidate.supporting_insertions,
+    )
+
+
 def validate_candidate(
     candidate: Candidate,
     target: TargetSpec,

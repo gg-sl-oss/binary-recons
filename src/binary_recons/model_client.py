@@ -6,9 +6,16 @@ from typing import Any
 
 import instructor
 from openai import OpenAI
+from pydantic import BaseModel
 
 from .llama_server import ManagedLlamaServer
-from .models import Candidate, CandidateBatch, ModelPreset, SearchConfig
+from .models import (
+    Candidate,
+    CandidateBatch,
+    ModelPreset,
+    SearchConfig,
+    SymbolProposalBatch,
+)
 from .prompts import SYSTEM_PROMPT
 
 
@@ -53,11 +60,29 @@ class CandidateGenerator:
         )
         return self._request(prompt, Candidate, seed)
 
+    def propose_symbols(
+        self,
+        prompt: str,
+        iteration: int,
+        candidate_index: int,
+        repair_attempt: int,
+    ) -> tuple[SymbolProposalBatch, Any]:
+        seed = (
+            self.config.seed + iteration * 1000 + candidate_index * 10 + repair_attempt
+        )
+        return self._request(
+            prompt,
+            SymbolProposalBatch,
+            seed,
+            max_tokens=min(self.config.max_tokens, 256),
+        )
+
     def _request(
         self,
         prompt: str,
-        response_model: type[Candidate] | type[CandidateBatch],
+        response_model: type[BaseModel],
         seed: int,
+        max_tokens: int | None = None,
     ) -> tuple[Any, Any]:
         self.server.ensure_alive()
         preset = self.server.config.resolved_preset()
@@ -82,7 +107,7 @@ class CandidateGenerator:
                 {"role": "user", "content": prompt},
             ],
             max_retries=self.config.format_retries,
-            max_tokens=self.config.max_tokens,
+            max_tokens=max_tokens or self.config.max_tokens,
             temperature=self.config.effective_temperature(preset),
             top_p=self.config.effective_top_p(preset),
             presence_penalty=self.config.effective_presence_penalty(preset),

@@ -272,3 +272,38 @@ ALLOWED SUPPORT FILES AND CURRENT CONTENT
 REJECTED COMPLETE CHANGE SET
 {candidate.model_dump_json(indent=2)}
 """
+
+
+def build_symbol_repair_prompt(
+    target: TargetSpec,
+    evidence: EvidenceBundle,
+    candidate: Candidate,
+    validation_feedback: str,
+) -> str:
+    return f"""\
+Propose exactly six fresh, meaningful C function identifiers for the rejected
+candidate below. This is a naming task only.
+
+NAMING REQUIREMENTS
+- Infer the function's purpose from the assembly, decompiler hint, and candidate.
+- Return six distinct VerbObject-style identifiers, strongest first.
+- Diversify both the leading verb and the object nouns across the six choices.
+- Do not return `{candidate.symbol}`.
+- Do not use an address, FUN/sub-style label, or vague Helper/Function name.
+- Do not alter or restate the interface or implementation.
+
+TARGET
+- Address: 0x{target.address:08X}
+
+VALIDATION DIAGNOSTIC
+{validation_feedback}
+
+ORIGINAL ASSEMBLY
+{evidence.original_assembly}
+
+DECOMPILER HINT
+{evidence.decompiler_hint}
+
+REJECTED CANDIDATE
+{candidate.source}
+"""

@@ -8,7 +8,13 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
-from .models import Candidate, CandidateBatch, SearchConfig, TargetSpec
+from .models import (
+    Candidate,
+    CandidateBatch,
+    SearchConfig,
+    SymbolProposalBatch,
+    TargetSpec,
+)
 from .utils import atomic_write, utc_now, write_json
 
 
@@ -120,6 +126,27 @@ class RunLog:
         if hasattr(completion, "model_dump"):
             completion = completion.model_dump(mode="json")
         write_json(prefix.with_suffix(".candidate.json"), candidate)
+        write_json(prefix.with_suffix(".completion.json"), completion)
+
+    def write_symbol_repair_generation(
+        self,
+        iteration: int,
+        index: int,
+        repair_attempt: int,
+        proposals: SymbolProposalBatch,
+        selected: str | None,
+        candidate: Candidate | None,
+        completion: Any,
+    ) -> None:
+        prefix = self._repair_prefix(iteration, index, repair_attempt)
+        if hasattr(completion, "model_dump"):
+            completion = completion.model_dump(mode="json")
+        write_json(
+            prefix.with_suffix(".symbols.json"),
+            {"proposals": proposals.symbols, "selected": selected},
+        )
+        if candidate is not None:
+            write_json(prefix.with_suffix(".candidate.json"), candidate)
         write_json(prefix.with_suffix(".completion.json"), completion)
 
     def write_repair_candidate(

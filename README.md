@@ -149,7 +149,9 @@ workspace is retained. A pre-build validation rejection or build failure
 triggers a narrow repair request that receives only the failing change set,
 diagnostics, project rules, and allowed support-file context. For an unnamed
 target, this includes recovering from a collision with an existing function
-name without Python inventing a replacement. Repairs may repair an earlier
+name without Python inventing a replacement: the model proposes a short,
+diverse name list, the driver rejects reserved entries, and the selected model
+name is applied only to the candidate contract. Repairs may repair an earlier
 repair; the default limit is two calls, configurable with `--repair-attempts`
 (`--compile-repair-attempts` remains an alias, and `0` disables repairs).
 

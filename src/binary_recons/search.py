@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from .prompts import (
     HistoryItem,
     build_compile_repair_prompt,
     build_prompt,
+    build_symbol_repair_prompt,
     build_validation_repair_prompt,
 )
 from .repository import (
@@ -19,6 +21,7 @@ from .repository import (
     candidate_fingerprint,
     current_function,
     normalize_candidate_marker,
+    rename_candidate_symbol,
     validate_candidate,
 )
 from .runlog import RunLog
@@ -38,6 +41,23 @@ class SearchResult:
 class _AttemptResult:
     score: float | None
     feedback: str
+
+
+def _select_symbol_proposal(
+    proposals: list[str],
+    reserved_symbols: set[str],
+    address: int,
+) -> str | None:
+    address_text = "%X" % address
+    for symbol in proposals:
+        if symbol in reserved_symbols:
+            continue
+        if re.match(r"(?i)^(?:FUN|sub|function|fn)_?[0-9a-f]*$", symbol):
+            continue
+        if address_text in symbol.upper():
+            continue
+        return symbol
+    return None
 
 
 class ReconstructionSearch:
@@ -275,14 +295,28 @@ class ReconstructionSearch:
                                         break
 
                                     repair_attempt = repair_attempts_used + 1
-                                    repair_prompt = build_validation_repair_prompt(
-                                        batch_contract,
-                                        evidence,
-                                        self.config,
-                                        candidate,
-                                        feedback,
-                                        repair_attempt,
+                                    name_collision = (
+                                        not contract_locked
+                                        and candidate.symbol in reserved_symbols
                                     )
+                                    if name_collision:
+                                        repair_prompt = build_symbol_repair_prompt(
+                                            batch_contract,
+                                            evidence,
+                                            candidate,
+                                            feedback,
+                                        )
+                                        repair_kind = "symbol"
+                                    else:
+                                        repair_prompt = build_validation_repair_prompt(
+                                            batch_contract,
+                                            evidence,
+                                            self.config,
+                                            candidate,
+                                            feedback,
+                                            repair_attempt,
+                                        )
+                                        repair_kind = "validation"
                                     run_log.write_repair_prompt(
                                         iteration,
                                         index,
@@ -291,31 +325,80 @@ class ReconstructionSearch:
                                     )
                                     print(
                                         "iteration %d candidate %d: requesting "
-                                        "validation repair %d/%d"
+                                        "%s repair %d/%d"
                                         % (
                                             iteration,
                                             index,
+                                            repair_kind,
                                             repair_attempt,
                                             self.config.compile_repair_attempts,
                                         ),
                                         flush=True,
                                     )
-                                    repaired, repair_completion = generator.repair(
-                                        repair_prompt,
-                                        iteration,
-                                        index,
-                                        repair_attempt,
-                                    )
-                                    run_log.write_repair_generation(
-                                        iteration,
-                                        index,
-                                        repair_attempt,
-                                        repaired,
-                                        repair_completion,
-                                    )
-                                    repaired_candidate = normalize_candidate_marker(
-                                        repaired, self.target.address
-                                    )
+                                    if name_collision:
+                                        proposals, repair_completion = (
+                                            generator.propose_symbols(
+                                                repair_prompt,
+                                                iteration,
+                                                index,
+                                                repair_attempt,
+                                            )
+                                        )
+                                        selected_symbol = _select_symbol_proposal(
+                                            proposals.symbols,
+                                            reserved_symbols,
+                                            self.target.address,
+                                        )
+                                        repaired_candidate = (
+                                            rename_candidate_symbol(
+                                                candidate, selected_symbol
+                                            )
+                                            if selected_symbol is not None
+                                            else None
+                                        )
+                                        run_log.write_symbol_repair_generation(
+                                            iteration,
+                                            index,
+                                            repair_attempt,
+                                            proposals,
+                                            selected_symbol,
+                                            repaired_candidate,
+                                            repair_completion,
+                                        )
+                                        repair_attempts_used = repair_attempt
+                                        if repaired_candidate is None:
+                                            feedback = (
+                                                "SYMBOL REPAIR REJECTED: every "
+                                                "proposal is reserved or invalid"
+                                            )
+                                            print(
+                                                "iteration %d candidate %d repair "
+                                                "%d: no usable symbol"
+                                                % (
+                                                    iteration,
+                                                    index,
+                                                    repair_attempt,
+                                                ),
+                                                flush=True,
+                                            )
+                                            continue
+                                    else:
+                                        repaired, repair_completion = generator.repair(
+                                            repair_prompt,
+                                            iteration,
+                                            index,
+                                            repair_attempt,
+                                        )
+                                        run_log.write_repair_generation(
+                                            iteration,
+                                            index,
+                                            repair_attempt,
+                                            repaired,
+                                            repair_completion,
+                                        )
+                                        repaired_candidate = normalize_candidate_marker(
+                                            repaired, self.target.address
+                                        )
                                     repaired_fingerprint = candidate_fingerprint(
                                         repaired_candidate
                                     )
