@@ -40,11 +40,15 @@ def build_prompt(
     target: TargetSpec,
     evidence: EvidenceBundle,
     config: SearchConfig,
-    best_candidate: str | None,
+    best_candidate: Candidate | None,
     feedback: str,
     history: list[HistoryItem],
 ) -> str:
-    current = best_candidate if best_candidate is not None else "<not implemented>"
+    current = (
+        best_candidate.model_dump_json(indent=2)
+        if best_candidate is not None
+        else "<not implemented>"
+    )
     last_result = feedback if feedback else "No candidate has been compiled yet."
     if target.has_contract:
         contract = f"""\
@@ -93,7 +97,15 @@ TARGET PROJECT
 - Return structured symbol, prototype, and source fields for every candidate.
 - Define only the target function, with no includes, declarations, helpers,
   surrounding file text, Markdown, placeholders, or unrelated edits.
-- Use only identifiers supported by the supplied project/declaration evidence.
+- Use only identifiers supported by the target or supplied project/declaration
+  evidence.
+- Return any target-required new types, globals, or matching global definitions
+  in supporting_insertions. Each insertion path must exactly match an allowed
+  support file below. These are append-only blocks: never repeat existing file
+  contents, edit existing declarations, or place the target prototype there.
+- A candidate must be a complete change set. If its function uses a new type or
+  global, include every declaration and definition needed to compile it. Use an
+  empty supporting_insertions list when no support is needed.
 
 TARGET-PROJECT RULES
 {evidence.project_guidance}
@@ -131,6 +143,9 @@ MECHANICALLY DISCOVERED DIRECT-CALLEE EVIDENCE
 MECHANICALLY DISCOVERED REFERENCED DECLARATIONS
 {evidence.declaration_evidence}
 
+ALLOWED SUPPORT FILES AND CURRENT CONTENT
+{evidence.supporting_file_evidence}
+
 CURRENT BEST CANDIDATE
 {current}
 
@@ -158,8 +173,8 @@ REPAIR PASS
 - Attempt {repair_attempt} of {config.compile_repair_attempts}.
 - This is a narrow compilation repair, not a new reconstruction attempt.
 - Preserve the candidate's behavior, control-flow shape, meaningful locals,
-  signature, marker, and function name unless a compiler diagnostic requires a
-  source-level correction.
+  signature, marker, function name, and valid supporting insertions unless a
+  build diagnostic requires a source-level correction.
 - Fix every compiler diagnostic shown. Do not explain the fix.
 
 TARGET CONTRACT
@@ -170,12 +185,16 @@ TARGET CONTRACT
   that the interface is not accepted.
 - Return symbol, prototype, and source fields that agree exactly.
 - Define only the target; include no declarations or surrounding file text.
+- Return a complete repaired supporting_insertions list. It replaces, rather
+  than supplements, the failing list.
 
 COMPILATION CONSTRAINTS
 - Language: {evidence.language}
 - Compiler/toolchain: {evidence.compiler}
 - Use exact identifiers and types from the supplied declaration evidence.
-- Do not invent helpers, wrappers, globals, fields, types, macros, or includes.
+- Add a type or global through an allowed support file only when target evidence
+  or a build diagnostic requires it. Do not invent unsupported helpers,
+  wrappers, fields, macros, or includes.
 - No placeholders, omitted bodies, Markdown, or unrelated edits.
 
 TARGET-PROJECT RULES
@@ -187,6 +206,9 @@ COMPILER DIAGNOSTICS
 MECHANICALLY DISCOVERED REFERENCED DECLARATIONS
 {evidence.declaration_evidence}
 
-FAILING C DEFINITION
-{candidate.source}
+ALLOWED SUPPORT FILES AND CURRENT CONTENT
+{evidence.supporting_file_evidence}
+
+FAILING COMPLETE CHANGE SET
+{candidate.model_dump_json(indent=2)}
 """

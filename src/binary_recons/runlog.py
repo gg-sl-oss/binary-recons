@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import time
 import re
+import time
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
@@ -54,6 +54,21 @@ class RunLog:
     def write_baseline(self, comparison: str) -> None:
         atomic_write(self.directory / "baseline.compare.txt", comparison)
 
+    def write_selected(
+        self,
+        candidate: Candidate,
+        score: float,
+        changed_files: list[str],
+    ) -> None:
+        write_json(
+            self.directory / "selected-change-set.json",
+            {
+                "candidate": candidate.model_dump(mode="json"),
+                "changed_files": changed_files,
+                "score": score,
+            },
+        )
+
     def write_prompt(self, iteration: int, prompt: str) -> None:
         atomic_write(self.directory / ("iteration-%02d.prompt.txt" % iteration), prompt)
 
@@ -75,11 +90,12 @@ class RunLog:
         self,
         iteration: int,
         index: int,
-        candidate: str,
+        candidate: Candidate,
         comparison: str,
     ) -> None:
         prefix = self.directory / ("iteration-%02d-candidate-%02d" % (iteration, index))
-        atomic_write(prefix.with_suffix(".c"), candidate.rstrip() + "\n")
+        write_json(prefix.with_suffix(".json"), candidate)
+        atomic_write(prefix.with_suffix(".c"), candidate.source.rstrip() + "\n")
         atomic_write(prefix.with_suffix(".compare.txt"), comparison.rstrip() + "\n")
 
     def write_repair_prompt(
@@ -111,11 +127,12 @@ class RunLog:
         iteration: int,
         index: int,
         repair_attempt: int,
-        candidate: str,
+        candidate: Candidate,
         comparison: str,
     ) -> None:
         prefix = self._repair_prefix(iteration, index, repair_attempt)
-        atomic_write(prefix.with_suffix(".c"), candidate.rstrip() + "\n")
+        write_json(prefix.with_suffix(".json"), candidate)
+        atomic_write(prefix.with_suffix(".c"), candidate.source.rstrip() + "\n")
         atomic_write(prefix.with_suffix(".compare.txt"), comparison.rstrip() + "\n")
 
     def _repair_prefix(

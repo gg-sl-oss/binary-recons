@@ -22,6 +22,8 @@ def discover_default_model_path() -> Path | None:
 DEFAULT_MODEL_PATH = discover_default_model_path()
 
 MAX_CANDIDATE_CHARS = 12000
+MAX_SUPPORTING_INSERTION_CHARS = 8000
+MAX_SUPPORTING_TOTAL_CHARS = 24000
 
 
 class ServerMode(str, Enum):
@@ -36,8 +38,33 @@ class ModelPreset(str, Enum):
     GEMMA = "gemma"
 
 
+class SupportingInsertion(BaseModel):
+    """One append-only declaration/definition block for a configured file."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(
+        min_length=1,
+        max_length=500,
+        description="Exact configured project-relative support-file path.",
+    )
+    content: str = Field(
+        min_length=1,
+        max_length=MAX_SUPPORTING_INSERTION_CHARS,
+        description=(
+            "Complete new declarations or definitions to insert into the file; "
+            "no surrounding file text or Markdown."
+        ),
+    )
+
+    @field_validator("path", "content")
+    @classmethod
+    def strip_text(cls, value: str) -> str:
+        return value.strip()
+
+
 class Candidate(BaseModel):
-    """One complete source definition proposed by the model."""
+    """One complete, bounded source change set proposed by the model."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -58,6 +85,14 @@ class Candidate(BaseModel):
         description=(
             "Complete target definition, including its Function start marker; "
             "no Markdown or explanation."
+        ),
+    )
+    supporting_insertions: list[SupportingInsertion] = Field(
+        default_factory=list,
+        max_length=8,
+        description=(
+            "New target-required declarations/definitions for configured support "
+            "files. Empty when the target needs none."
         ),
     )
 
@@ -124,6 +159,7 @@ class EvidenceBundle(BaseModel):
     reserved_symbols: str
     callee_evidence: str
     declaration_evidence: str
+    supporting_file_evidence: str
 
 
 class SearchConfig(BaseModel):
@@ -140,7 +176,7 @@ class SearchConfig(BaseModel):
     request_timeout: float = Field(default=180.0, gt=0)
     build_timeout: float = Field(default=120.0, gt=0)
     format_retries: int = Field(default=1, ge=0, le=3)
-    compile_repair_attempts: int = Field(default=1, ge=0, le=3)
+    compile_repair_attempts: int = Field(default=2, ge=0, le=3)
     seed: int
     temperature: float | None = Field(default=None, ge=0.0, le=2.0)
     top_p: float | None = Field(default=None, gt=0.0, le=1.0)

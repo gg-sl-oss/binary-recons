@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import subprocess
 from pathlib import Path
 
-from .models import MAX_CANDIDATE_CHARS, Candidate, EvidenceBundle, TargetSpec
+from .models import (
+    MAX_CANDIDATE_CHARS,
+    MAX_SUPPORTING_TOTAL_CHARS,
+    Candidate,
+    EvidenceBundle,
+    TargetSpec,
+)
 from .project_config import ProjectConfig, load_project_config
 from .utils import atomic_write, read_text
 
@@ -17,6 +24,8 @@ SIMILARITY_RE = re.compile(r"Similarity:\s*([0-9]+(?:\.[0-9]+)?)%")
 COMPILER_ERROR_RE = re.compile(
     r"(?:\bfatal error(?:\s+[A-Z]+\d+)?\b|"
     r"\berror\s+(?:C|LNK|U)\d{4}\b|"
+    r"\bundefined reference\b|"
+    r"\bunresolved external\b|"
     r":\s*error:)",
     re.I | re.M,
 )
@@ -101,7 +110,23 @@ def replace_or_insert_function(source: str, address: int, candidate: str) -> str
     return source.rstrip() + "\n\n" + candidate.rstrip() + "\n"
 
 
-def candidate_fingerprint(candidate: str) -> str:
+def candidate_fingerprint(candidate: str | Candidate) -> str:
+    if isinstance(candidate, Candidate):
+        candidate = json.dumps(
+            {
+                "symbol": candidate.symbol,
+                "prototype": re.sub(r"\s+", " ", candidate.prototype).strip(),
+                "source": re.sub(r"\s+", " ", candidate.source).strip(),
+                "supporting_insertions": sorted(
+                    (
+                        insertion.path,
+                        re.sub(r"\s+", " ", insertion.content).strip(),
+                    )
+                    for insertion in candidate.supporting_insertions
+                ),
+            },
+            sort_keys=True,
+        )
     normalized = re.sub(r"\s+", " ", candidate).strip()
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
@@ -119,6 +144,7 @@ def validate_candidate(
     candidate: Candidate,
     target: TargetSpec,
     reserved_symbols: set[str] | None = None,
+    allowed_support_paths: set[str] | None = None,
 ) -> None:
     source = candidate.source
     canonical_marker = "/* Function start: 0x%X */" % target.address
@@ -157,6 +183,34 @@ def validate_candidate(
             errors.append("candidate contains %s" % description)
     if source.count("{") != source.count("}"):
         errors.append("candidate braces are unbalanced")
+
+    insertion_paths: set[str] = set()
+    total_insertion_chars = sum(
+        len(insertion.content) for insertion in candidate.supporting_insertions
+    )
+    if total_insertion_chars > MAX_SUPPORTING_TOTAL_CHARS:
+        errors.append(
+            "supporting insertions exceed the %d-character safety limit"
+            % MAX_SUPPORTING_TOTAL_CHARS
+        )
+    for insertion in candidate.supporting_insertions:
+        if insertion.path in insertion_paths:
+            errors.append("support file %s occurs more than once" % insertion.path)
+        insertion_paths.add(insertion.path)
+        if allowed_support_paths is None or insertion.path not in allowed_support_paths:
+            errors.append("support file is not configured: %s" % insertion.path)
+        if "```" in insertion.content:
+            errors.append("support insertion contains a Markdown code fence")
+        if "Function start:" in insertion.content:
+            errors.append("support insertion contains a function marker")
+        if re.search(r"(?m)^\s*#", insertion.content):
+            errors.append("support insertion contains a preprocessor directive")
+        if insertion.content.count("{") != insertion.content.count("}"):
+            errors.append("support insertion braces are unbalanced")
+        if re.search(r"\)\s*(?:const\s*)?\{", insertion.content):
+            errors.append("support insertion contains a function definition")
+        if re.search(r"\b%s\s*\(" % re.escape(candidate.symbol), insertion.content):
+            errors.append("target prototype belongs in the managed prototype file")
     if errors:
         raise ValueError("; ".join(errors))
 
@@ -248,7 +302,63 @@ class ProjectRepository:
                 decompilation,
                 excluded_address=None if target.has_contract else target.address,
             ),
+            supporting_file_evidence=self._supporting_file_evidence(),
         )
+
+    def _display_path(self, path: Path) -> str:
+        try:
+            return path.relative_to(self.root).as_posix()
+        except ValueError:
+            return str(path)
+
+    def support_file_map(self) -> dict[str, tuple[Path, str, str]]:
+        result: dict[str, tuple[Path, str, str]] = {}
+        prototype_path = (
+            self.config.resolve(self.root, self.config.prototype_file).resolve()
+            if self.config.prototype_file is not None
+            else None
+        )
+        for support in self.config.support_files:
+            path = self.config.resolve(self.root, support.path).resolve()
+            display = self._display_path(path)
+            if display in result:
+                raise RuntimeError("duplicate resolved support file: %s" % display)
+            if path == prototype_path:
+                raise RuntimeError(
+                    "prototype file cannot also be a support file: %s" % display
+                )
+            result[display] = (path, support.purpose, support.insertion)
+        return result
+
+    def allowed_support_paths(self) -> set[str]:
+        return set(self.support_file_map())
+
+    def _supporting_file_evidence(self, character_limit: int = 16000) -> str:
+        configured = self.support_file_map()
+        if not configured:
+            return (
+                "No support files are configured. supporting_insertions must be empty."
+            )
+        blocks: list[str] = []
+        for display, (path, purpose, insertion) in configured.items():
+            if not path.exists():
+                raise RuntimeError("missing configured support file: %s" % path)
+            content = read_text(path)
+            if len(content) > 6000:
+                content = (
+                    content[:3000]
+                    + "\n... mechanically truncated ...\n"
+                    + content[-2800:]
+                )
+            blocks.append(
+                "[allowed support file: %s]\n"
+                "Purpose: %s\nInsertion mode: %s\nCurrent content:\n%s"
+                % (display, purpose, insertion, content.rstrip())
+            )
+        result = "\n\n".join(blocks)
+        if len(result) <= character_limit:
+            return result
+        return result[:character_limit] + "\n... support-file context truncated ..."
 
     def _concise_decompilation(self, text: str, symbol: str | None) -> str:
         # The assembly export may carry a recovered developer name while the
@@ -510,29 +620,136 @@ class ProjectRepository:
         score = float(match.group(1)) if match is not None else None
         return score, result.stdout
 
-    def persist_contract(self, target: TargetSpec) -> None:
-        """Write a winning model-proposed prototype to the configured header."""
+    def snapshot_workspace(self, target: TargetSpec) -> dict[Path, str]:
+        """Capture every file a candidate evaluation is permitted to change."""
 
-        if not target.has_contract or self.config.prototype_file is None:
-            return
+        paths = {target.source_path.resolve()}
+        if self.config.prototype_file is not None:
+            paths.add(
+                self.config.resolve(self.root, self.config.prototype_file).resolve()
+            )
+        paths.update(path for path, _, _ in self.support_file_map().values())
+        missing = sorted(str(path) for path in paths if not path.exists())
+        if missing:
+            raise RuntimeError(
+                "missing candidate workspace file(s): %s" % ", ".join(missing)
+            )
+        return {path: read_text(path) for path in sorted(paths)}
+
+    def render_candidate_workspace(
+        self,
+        target: TargetSpec,
+        candidate: Candidate,
+        baseline: dict[Path, str],
+    ) -> dict[Path, str]:
+        """Render a complete candidate change set without touching the filesystem."""
+
+        if not target.has_contract:
+            raise RuntimeError("cannot render a candidate without an active contract")
+        workspace = dict(baseline)
+        source_path = target.source_path.resolve()
+        if source_path not in workspace:
+            raise RuntimeError("target source is outside the candidate workspace")
+        workspace[source_path] = replace_or_insert_function(
+            workspace[source_path], target.address, candidate.source
+        )
+
+        if self.config.prototype_file is not None:
+            prototype_path = self.config.resolve(
+                self.root, self.config.prototype_file
+            ).resolve()
+            if prototype_path not in workspace:
+                raise RuntimeError("prototype file is outside the candidate workspace")
+            workspace[prototype_path] = self._render_contract(
+                workspace[prototype_path], target
+            )
+
+        configured = self.support_file_map()
+        for insertion in candidate.supporting_insertions:
+            if insertion.path not in configured:
+                raise RuntimeError(
+                    "candidate references an unconfigured support file: %s"
+                    % insertion.path
+                )
+            support_path, _, mode = configured[insertion.path]
+            if support_path == source_path:
+                raise RuntimeError(
+                    "target source cannot also receive a supporting insertion"
+                )
+            workspace[support_path] = self._insert_supporting_content(
+                workspace[support_path], insertion.content, mode, support_path
+            )
+        return workspace
+
+    @staticmethod
+    def apply_workspace(workspace: dict[Path, str]) -> None:
+        for path in sorted(workspace):
+            if path.exists() and read_text(path) == workspace[path]:
+                continue
+            atomic_write(path, workspace[path])
+
+    def changed_workspace_files(
+        self,
+        baseline: dict[Path, str],
+        candidate: dict[Path, str],
+    ) -> list[str]:
+        return [
+            self._display_path(path)
+            for path in sorted(candidate)
+            if candidate[path] != baseline[path]
+        ]
+
+    @staticmethod
+    def _insert_supporting_content(
+        source: str,
+        insertion: str,
+        mode: str,
+        path: Path,
+    ) -> str:
+        snippet = insertion.strip()
+        if snippet in source:
+            return source
+        if mode == "auto":
+            mode = (
+                "before-final-endif"
+                if path.suffix.lower() in {".h", ".hh", ".hpp", ".hxx"}
+                else "append"
+            )
+        if mode == "append":
+            return source.rstrip() + "\n\n" + snippet + "\n"
+        if mode == "before-final-endif":
+            matches = list(re.finditer(r"(?m)^\s*#\s*endif\b", source))
+            if not matches:
+                raise RuntimeError(
+                    "support file has no final #endif insertion point: %s" % path
+                )
+            position = matches[-1].start()
+            return (
+                source[:position].rstrip()
+                + "\n\n"
+                + snippet
+                + "\n\n"
+                + source[position:].lstrip("\n")
+            )
+        raise RuntimeError("unknown support insertion mode: %s" % mode)
+
+    @staticmethod
+    def _render_contract(source: str, target: TargetSpec) -> str:
+        if not target.has_contract:
+            return source
         assert target.symbol is not None
         assert target.prototype is not None
-        path = self.config.resolve(self.root, self.config.prototype_file)
-        if not path.exists():
-            raise RuntimeError("missing configured prototype file: %s" % path)
-
-        lines = read_text(path).splitlines()
+        lines = source.splitlines()
         declaration = "%s; /* 0x%08X */" % (target.prototype, target.address)
         address_pattern = re.compile(r"(?i)0x0*%x\b" % target.address)
         for index, line in enumerate(lines):
             if address_pattern.search(line):
                 lines[index] = declaration
-                atomic_write(path, "\n".join(lines) + "\n")
-                return
+                return "\n".join(lines) + "\n"
         if any(
             re.search(r"\b%s\s*\(" % re.escape(target.symbol), line) for line in lines
         ):
-            return
+            return source
 
         insertion = next(
             (
@@ -547,7 +764,20 @@ class ProjectRepository:
             ),
         )
         lines.insert(insertion, declaration)
-        atomic_write(path, "\n".join(lines) + "\n")
+        return "\n".join(lines) + "\n"
+
+    def persist_contract(self, target: TargetSpec) -> None:
+        """Write a winning model-proposed prototype to the configured header."""
+
+        if not target.has_contract or self.config.prototype_file is None:
+            return
+        assert target.symbol is not None
+        assert target.prototype is not None
+        path = self.config.resolve(self.root, self.config.prototype_file)
+        if not path.exists():
+            raise RuntimeError("missing configured prototype file: %s" % path)
+
+        atomic_write(path, self._render_contract(read_text(path), target))
 
     @staticmethod
     def compact_feedback(output: str, score: float | None) -> str:
@@ -573,3 +803,9 @@ class ProjectRepository:
     @staticmethod
     def has_compiler_errors(output: str) -> bool:
         return COMPILER_ERROR_RE.search(output) is not None
+
+    @staticmethod
+    def is_repairable_build_failure(output: str) -> bool:
+        """Allow bounded repair for diagnostics, but not a timed-out build."""
+
+        return bool(output.strip()) and "BUILD/COMPARE TIMED OUT" not in output

@@ -74,8 +74,8 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument(
         "--compile-repair-attempts",
         type=int,
-        default=1,
-        help="focused LLM repair calls after compiler errors (0 disables)",
+        default=2,
+        help="focused LLM repair calls after build failures (0 disables)",
     )
     search.add_argument(
         "--seed",

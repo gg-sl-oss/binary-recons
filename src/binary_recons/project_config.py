@@ -6,6 +6,7 @@ import re
 import tomllib
 from importlib.resources import files
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -48,6 +49,16 @@ class SourceUnit(BaseModel):
         return self
 
 
+class SupportFile(BaseModel):
+    """One explicitly writable file for model-proposed supporting insertions."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: Path
+    purpose: str = Field(min_length=1, max_length=500)
+    insertion: Literal["auto", "append", "before-final-endif"] = "auto"
+
+
 class ProjectConfig(BaseModel):
     """All target layout, compiler, prompt, and comparison conventions."""
 
@@ -64,8 +75,20 @@ class ProjectConfig(BaseModel):
     prototype_file: Path | None = None
     rule_profiles: list[str] = Field(default_factory=list)
     prompt_files: list[Path] = Field(default_factory=list)
+    support_files: list[SupportFile] = Field(default_factory=list)
     compare_command: list[str] = Field(min_length=1)
     source_units: list[SourceUnit] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_support_files(self) -> "ProjectConfig":
+        paths = [support.path for support in self.support_files]
+        if len(paths) != len(set(paths)):
+            raise ValueError("support-file paths must be unique")
+        if self.prototype_file is not None and self.prototype_file in paths:
+            raise ValueError(
+                "prototype_file is managed separately and cannot be a support file"
+            )
+        return self
 
     def resolve(self, root: Path, path: Path) -> Path:
         return path if path.is_absolute() else root / path

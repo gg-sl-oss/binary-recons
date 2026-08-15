@@ -3,9 +3,9 @@
 [![CI](https://github.com/gg-sl-oss/binary-recons/actions/workflows/ci.yml/badge.svg)](https://github.com/gg-sl-oss/binary-recons/actions/workflows/ci.yml)
 
 `binary-recons` runs a bounded generate, compile, and assembly-compare loop for
-recovering one source function at a time with a local language model. Python
-owns repository edits and comparisons; the model receives a structured prompt
-and never receives shell or filesystem tools.
+recovering one source function at a time with a local language model. Python is
+the restricted driver: the model receives a structured prompt, proposes one
+typed change set, and never receives shell or unrestricted filesystem tools.
 
 Target-specific layout, compiler details, reconstruction rules, and comparison
 commands belong in the target repository. The Python package contains no
@@ -41,6 +41,18 @@ rule_profiles = ["c89", "msvc4-od"]
 prompt_files = ["RECONSTRUCTION.md"]
 compare_command = ["make", "compare-func", "FUNC={symbol}", "ADDR={address_hex}"]
 
+[[support_files]]
+path = "include/types.h"
+purpose = "Shared source-level type declarations."
+
+[[support_files]]
+path = "include/globals.h"
+purpose = "Extern declarations for evidenced globals."
+
+[[support_files]]
+path = "src/globals.c"
+purpose = "Definitions matching newly declared globals."
+
 [[source_units]]
 path = "src/game.c"
 start = 0x00401000
@@ -50,6 +62,14 @@ end = 0x0040ffff
 The comparison command may use `{symbol}`, `{address}`, and `{address_hex}`.
 It must compile the current source and print a `Similarity: N%` line from the
 project's comparison authority.
+
+`support_files` are optional, explicitly writable files for declarations or
+definitions required by the target. Their `purpose` is included in the prompt.
+Model output can only add one bounded snippet to each configured file; it
+cannot replace existing contents or write any other path. Header snippets are
+inserted before the final `#endif`, while other files are appended. Set
+`insertion = "append"` or `insertion = "before-final-endif"` to override that
+automatic choice.
 
 When `strings_file` is configured, only entries whose addresses occur in the
 target assembly or decompilation are added to the prompt. This supplies exact
@@ -76,7 +96,8 @@ The prompt supplies already-selected function names as a reserved-name list,
 without exposing their interfaces, so independent model proposals cannot
 collide. If a model omits the required address marker, Python adds that
 mechanical comment before validation; a wrong or duplicate marker is still
-rejected.
+rejected. A candidate may also return a complete list of supporting type/global
+insertions, but only for the configured support files.
 
 Project-specific rules live in the configured prompt files and are included
 verbatim in each request.
@@ -121,8 +142,20 @@ Use `--dry-run-prompt` to inspect all collected evidence without loading a
 model. Runs are recorded under the configured `output_dir`, grouped by model,
 address, and timestamp.
 
-Each model response is validated before it can replace source. Candidates are
-compiled and compared one at a time, and only the best result is retained. If a
-candidate reaches the compiler but has compiler errors, a separately bounded
-repair request receives the failing definition and diagnostics. Set
-`--compile-repair-attempts 0` to disable that step.
+Each model response is validated before it can replace source. The target
+definition, managed prototype, and all supporting insertions are applied as one
+transaction, compiled, compared, and then rolled back. Only the best complete
+workspace is retained. A build failure triggers a narrow repair request that
+receives only the failing change set, diagnostics, project rules, and allowed
+support-file context. Repairs may repair an earlier repair; the default limit
+is two calls, configurable with `--compile-repair-attempts` (or `0` to disable).
+
+Every normal candidate and repair is logged as both its function source and its
+full structured change set. `selected-change-set.json` records the exact
+retained model output, score, and files changed. Exceptions, interruptions, and
+exhausted failed repairs restore the last successfully compiled workspace.
+
+This restricted path is intentionally the default for smaller local models: it
+has no recursive exploration or expanding tool context. A future external
+agent integration can use the same evidence/submit/diagnostics boundary for
+exceptional functions without widening ordinary runs.
