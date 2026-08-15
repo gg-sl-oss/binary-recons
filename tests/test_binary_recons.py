@@ -75,6 +75,7 @@ def make_fixture_project(root: Path) -> None:
         'compiler = "Fixture Compiler 1.0"\n'
         'exports_dir = "analysis"\n'
         'output_dir = "artifacts/reconstruction"\n'
+        'strings_file = "analysis/strings.txt"\n'
         'source_dirs = ["src"]\n'
         'declaration_files = ["include/*.h"]\n'
         'rule_profiles = ["c89"]\n'
@@ -87,6 +88,7 @@ def make_fixture_project(root: Path) -> None:
         "end = 0x4010ff\n",
     )
     write_fixture(root, "RECONSTRUCTION.md", "Use portable fixture source.\n")
+    write_fixture(root, "analysis/strings.txt", '0x00403000: "fixture text"\n')
     write_fixture(root, "src/sample.c", '#include "project.h"\n')
     write_fixture(
         root,
@@ -105,6 +107,7 @@ def make_fixture_project(root: Path) -> None:
         "Function: sample_function\n"
         "Address: 0x00401000\n\n"
         "MOV EAX,0x7\n"
+        "PUSH 0x403000\n"
         "CMP EAX,0x7\n"
         "RET\n",
     )
@@ -177,6 +180,7 @@ class RepositoryTests(unittest.TestCase):
             prompt = prompts[0].read_text(encoding="utf-8")
             self.assertIn("[shared profile: c89]", prompt)
             self.assertIn("[project file: RECONSTRUCTION.md]", prompt)
+            self.assertIn('0x00403000: "fixture text"', prompt)
 
     def test_insertion_is_address_sorted(self) -> None:
         source = """/* Function start: 0x100 */

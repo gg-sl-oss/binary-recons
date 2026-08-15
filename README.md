@@ -33,6 +33,7 @@ language = "C"
 compiler = "Microsoft Visual C++ 4.20"
 exports_dir = "ghidra"
 output_dir = "out/binary-recons"
+strings_file = "ghidra/strings.txt"
 source_dirs = ["src"]
 declaration_files = ["include/*.h"]
 rule_profiles = ["c89", "msvc4-od"]
@@ -48,6 +49,10 @@ end = 0x0040ffff
 The comparison command may use `{symbol}`, `{address}`, and `{address_hex}`.
 It must compile the current source and print a `Similarity: N%` line from the
 project's comparison authority.
+
+When `strings_file` is configured, only entries whose addresses occur in the
+target assembly or decompilation are added to the prompt. This supplies exact
+literal text without adding unrelated context.
 
 Assembly and decompiler exports use these names by default:
 

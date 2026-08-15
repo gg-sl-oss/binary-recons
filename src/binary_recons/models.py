@@ -89,6 +89,7 @@ class EvidenceBundle(BaseModel):
     project_guidance: str
     original_assembly: str
     decompiler_hint: str
+    string_evidence: str
     callee_evidence: str
     declaration_evidence: str
 

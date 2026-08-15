@@ -58,6 +58,7 @@ class ProjectConfig(BaseModel):
     compiler: str = Field(min_length=1)
     exports_dir: Path = Path("ghidra")
     output_dir: Path = Path("out/binary-recons")
+    strings_file: Path | None = None
     source_dirs: list[Path] = Field(default_factory=lambda: [Path("src")])
     declaration_files: list[str] = Field(default_factory=list)
     rule_profiles: list[str] = Field(default_factory=list)

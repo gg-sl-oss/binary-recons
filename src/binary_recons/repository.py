@@ -225,6 +225,7 @@ class ProjectRepository:
             project_guidance=self.config.guidance(self.root),
             original_assembly=assembly.strip(),
             decompiler_hint=self._concise_decompilation(decompilation, target.symbol),
+            string_evidence=self._string_evidence(assembly, decompilation),
             callee_evidence=self._callee_evidence(assembly, max_callees),
             declaration_evidence=self._declaration_evidence(decompilation),
         )
@@ -246,6 +247,30 @@ class ProjectRepository:
         if match is not None:
             return text[match.start() :].strip()[:6000]
         return text.strip()[:6000]
+
+    def _string_evidence(self, assembly: str, decompilation: str) -> str:
+        configured = self.config.strings_file
+        if configured is None:
+            return "No string map is configured for this target project."
+        path = self.config.resolve(self.root, configured)
+        if not path.exists():
+            raise RuntimeError("missing configured string map: %s" % path)
+
+        referenced = {
+            int(raw, 16)
+            for raw in re.findall(
+                r"(?i)(?<![0-9a-f])(?:0x|_)?([0-9a-f]{6,8})(?![0-9a-f])",
+                assembly + "\n" + decompilation,
+            )
+        }
+        evidence: list[str] = []
+        for line in read_text(path).splitlines():
+            match = re.match(r"(?i)^0x([0-9a-f]{6,8})\s*:", line)
+            if match is not None and int(match.group(1), 16) in referenced:
+                evidence.append(line.strip())
+        if not evidence:
+            return "No string-map entries matched this function's evidence."
+        return "\n".join(evidence)[:6000]
 
     def _callee_evidence(self, assembly: str, max_callees: int) -> str:
         addresses: list[int] = []
