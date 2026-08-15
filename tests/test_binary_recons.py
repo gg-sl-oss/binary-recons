@@ -447,10 +447,12 @@ class LlamaServerTests(unittest.TestCase):
     def test_model_presets_keep_qwen_flags_out_of_gemma(self) -> None:
         search = SearchConfig(seed=1, max_iterations=1)
         qwen = LlamaServerConfig(
+            binary=Path("llama-server"),
             model_path=Path("qwen.gguf"),
             preset=ModelPreset.QWEN,
         )
         gemma = LlamaServerConfig(
+            binary=Path("llama-server"),
             model_path=Path("gemma.gguf"),
             preset=ModelPreset.GEMMA,
         )
