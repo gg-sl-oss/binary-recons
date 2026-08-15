@@ -106,7 +106,20 @@ def candidate_fingerprint(candidate: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
-def validate_candidate(candidate: Candidate, target: TargetSpec) -> None:
+def normalize_candidate_marker(candidate: Candidate, address: int) -> Candidate:
+    """Add the purely mechanical address marker when the model omitted it."""
+
+    if "Function start:" in candidate.source:
+        return candidate
+    source = "/* Function start: 0x%X */\n%s" % (address, candidate.source)
+    return candidate.model_copy(update={"source": source})
+
+
+def validate_candidate(
+    candidate: Candidate,
+    target: TargetSpec,
+    reserved_symbols: set[str] | None = None,
+) -> None:
     source = candidate.source
     canonical_marker = "/* Function start: 0x%X */" % target.address
     errors: list[str] = []
@@ -126,6 +139,8 @@ def validate_candidate(candidate: Candidate, target: TargetSpec) -> None:
         errors.append("candidate symbol must be a meaningful source-level name")
     if "%X" % target.address in candidate.symbol.upper():
         errors.append("candidate symbol must not contain the target address")
+    if reserved_symbols is not None and candidate.symbol in reserved_symbols:
+        errors.append("candidate symbol is already used by another function")
 
     compact = re.sub(r"\s+", " ", source)
     if re.sub(r"\s+", " ", candidate.prototype) not in compact:
@@ -227,6 +242,7 @@ class ProjectRepository:
             original_assembly=assembly.strip(),
             decompiler_hint=self._concise_decompilation(decompilation, target.symbol),
             string_evidence=self._string_evidence(assembly, decompilation),
+            reserved_symbols=self._reserved_symbol_evidence(target),
             callee_evidence=self._callee_evidence(assembly, max_callees),
             declaration_evidence=self._declaration_evidence(
                 decompilation,
@@ -276,6 +292,46 @@ class ProjectRepository:
         if not evidence:
             return "No string-map entries matched this function's evidence."
         return "\n".join(evidence)[:6000]
+
+    def reserved_symbols(self, target: TargetSpec) -> list[str]:
+        symbols: set[str] = set()
+        target_address = target.address
+        for path in self.config.declarations(self.root):
+            for line in read_text(path).splitlines():
+                address_match = re.search(r"(?i)0x([0-9a-f]{6,8})", line)
+                if (
+                    address_match is not None
+                    and int(address_match.group(1), 16) == target_address
+                ):
+                    continue
+                match = re.search(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", line)
+                if match is not None:
+                    symbols.add(match.group(1))
+
+        for directory in self.config.source_paths(self.root):
+            if not directory.exists():
+                continue
+            for path in sorted(directory.rglob("*")):
+                if not path.is_file() or path.suffix.lower() not in SOURCE_SUFFIXES:
+                    continue
+                text = read_text(path)
+                for marker in MARKER_RE.finditer(text):
+                    if int(marker.group(1), 16) == target_address:
+                        continue
+                    tail = text[marker.end() :]
+                    symbol = definition_symbol(tail)
+                    if symbol is not None:
+                        symbols.add(symbol)
+        return sorted(symbols)
+
+    def _reserved_symbol_evidence(self, target: TargetSpec) -> str:
+        symbols = self.reserved_symbols(target)
+        if not symbols:
+            return "No source-level function names are reserved yet."
+        return (
+            "Do not reuse any of these names; their interfaces are intentionally "
+            "not supplied:\n" + ", ".join(symbols[:200])
+        )
 
     def _callee_evidence(self, assembly: str, max_callees: int) -> str:
         addresses: list[int] = []

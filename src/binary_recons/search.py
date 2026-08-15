@@ -13,6 +13,7 @@ from .repository import (
     ProjectRepository,
     candidate_fingerprint,
     current_function,
+    normalize_candidate_marker,
     replace_or_insert_function,
     validate_candidate,
 )
@@ -83,6 +84,7 @@ class ReconstructionSearch:
         best_feedback = ""
         history: list[HistoryItem] = []
         seen: set[str] = set()
+        reserved_symbols = set(self.repository.reserved_symbols(self.target))
         attempts = 0
 
         try:
@@ -186,7 +188,9 @@ class ReconstructionSearch:
                             : self.config.candidates_per_iteration
                         ]
                         for index, proposed in enumerate(candidates, 1):
-                            candidate = proposed
+                            candidate = normalize_candidate_marker(
+                                proposed, self.target.address
+                            )
                             candidate_target = (
                                 batch_contract
                                 if batch_contract.has_contract
@@ -211,7 +215,9 @@ class ReconstructionSearch:
                             attempts += 1
 
                             try:
-                                validate_candidate(candidate, candidate_target)
+                                validate_candidate(
+                                    candidate, candidate_target, reserved_symbols
+                                )
                             except ValueError as error:
                                 feedback = "CANDIDATE REJECTED BEFORE BUILD: %s" % error
                                 run_log.write_candidate(
@@ -296,7 +302,9 @@ class ReconstructionSearch:
                                         repair_completion,
                                     )
 
-                                    repaired_candidate = repaired
+                                    repaired_candidate = normalize_candidate_marker(
+                                        repaired, self.target.address
+                                    )
                                     repaired_fingerprint = candidate_fingerprint(
                                         repaired_candidate.source
                                     )
@@ -324,7 +332,11 @@ class ReconstructionSearch:
                                     candidate = repaired_candidate
                                     fingerprint = repaired_fingerprint
                                     try:
-                                        validate_candidate(candidate, candidate_target)
+                                        validate_candidate(
+                                            candidate,
+                                            candidate_target,
+                                            reserved_symbols,
+                                        )
                                     except ValueError as error:
                                         score = None
                                         feedback = (

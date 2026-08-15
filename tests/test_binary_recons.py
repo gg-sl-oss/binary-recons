@@ -32,6 +32,7 @@ from binary_recons.models import (  # noqa: E402
 from binary_recons.repository import (  # noqa: E402
     ProjectRepository,
     current_function,
+    normalize_candidate_marker,
     replace_or_insert_function,
 )
 from binary_recons.search import ReconstructionSearch  # noqa: E402
@@ -94,7 +95,8 @@ def make_fixture_project(root: Path) -> None:
     write_fixture(
         root,
         "include/functions.h",
-        "int sample_function(void); /* 0x00401000 */\n",
+        "int sample_function(void); /* 0x00401000 */\n"
+        "void ExistingHelper(void); /* 0x00402000 */\n",
     )
     write_fixture(
         root,
@@ -153,6 +155,9 @@ class RepositoryTests(unittest.TestCase):
             self.assertIsNone(target.symbol)
             self.assertEqual(target.source_path, (root / "src/sample.c").resolve())
             self.assertIsNone(target.prototype)
+            self.assertEqual(
+                ProjectRepository(root).reserved_symbols(target), ["ExistingHelper"]
+            )
 
     def test_cli_dry_run_uses_project_root(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -184,6 +189,7 @@ class RepositoryTests(unittest.TestCase):
             self.assertIn('0x00403000: "fixture text"', prompt)
             self.assertIn("No source-level name or interface is supplied", prompt)
             self.assertNotIn("int sample_function(void)", prompt)
+            self.assertIn("ExistingHelper", prompt)
 
     def test_existing_definition_keeps_its_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -297,6 +303,20 @@ void OperationalLabel(void)
             source="x" * 6000,
         )
         self.assertEqual(len(candidate.source), 6000)
+
+    def test_missing_address_marker_is_added_mechanically(self) -> None:
+        candidate = Candidate(
+            symbol="ComputeFixtureValue",
+            prototype="int ComputeFixtureValue(void)",
+            source="""int ComputeFixtureValue(void)
+{
+    return 7;
+}""",
+        )
+        normalized = normalize_candidate_marker(candidate, 0x00401000)
+        self.assertTrue(
+            normalized.source.startswith("/* Function start: 0x401000 */\n")
+        )
 
     def test_compiler_errors_are_distinguished_from_compare_failures(self) -> None:
         self.assertTrue(

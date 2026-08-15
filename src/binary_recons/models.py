@@ -121,6 +121,7 @@ class EvidenceBundle(BaseModel):
     original_assembly: str
     decompiler_hint: str
     string_evidence: str
+    reserved_symbols: str
     callee_evidence: str
     declaration_evidence: str
 

@@ -62,7 +62,7 @@ ghidra/FUN_00401000.disassembled.txt
 ghidra/FUN_00401000.decompiled.txt
 ```
 
-The assembly export should begin with `Function: <symbol>` when the source does
+The assembly export should begin with `Function: <label>` when the source does
 not yet contain a definition, but that export label is not treated as a source
 contract. For an unimplemented address, neither a name nor a prototype is put
 in the target contract: each structured candidate must infer and return a
@@ -71,6 +71,12 @@ evidence. The winning prototype is written to `prototype_file` with its address
 for use by later reconstructions. Existing definitions retain their established
 contract, and callers may still override it explicitly with `--symbol` and
 `--prototype`.
+
+The prompt supplies already-selected function names as a reserved-name list,
+without exposing their interfaces, so independent model proposals cannot
+collide. If a model omits the required address marker, Python adds that
+mechanical comment before validation; a wrong or duplicate marker is still
+rejected.
 
 Project-specific rules live in the configured prompt files and are included
 verbatim in each request.
