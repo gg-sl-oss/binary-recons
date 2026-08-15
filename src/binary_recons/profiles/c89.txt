@@ -1,0 +1,12 @@
+C89 SOURCE PROFILE
+
+- Produce C accepted by a C89-era compiler. Do not use declarations in for-loop
+  initializers, mixed declarations and statements within one block, compound
+  literals, designated initializers, variable-length arrays, or other C99+
+  syntax.
+- Put each meaningful local declaration before statements in its containing
+  block. Preserve declaration order when assembly exposes stack-slot or
+  register-allocation differences.
+- Use the target project's declared integer and pointer types. Do not silently
+  replace narrower types with int when operand width or extension instructions
+  distinguish them.

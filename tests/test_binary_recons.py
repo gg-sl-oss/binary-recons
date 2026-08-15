@@ -77,6 +77,7 @@ def make_fixture_project(root: Path) -> None:
         'output_dir = "artifacts/reconstruction"\n'
         'source_dirs = ["src"]\n'
         'declaration_files = ["include/*.h"]\n'
+        'rule_profiles = ["c89"]\n'
         'prompt_files = ["RECONSTRUCTION.md"]\n'
         'compare_command = ["fixture-compare", "{symbol}", "{address_hex}"]\n'
         "\n"
@@ -173,6 +174,9 @@ class RepositoryTests(unittest.TestCase):
                 )
             )
             self.assertEqual(len(prompts), 1)
+            prompt = prompts[0].read_text(encoding="utf-8")
+            self.assertIn("[shared profile: c89]", prompt)
+            self.assertIn("[project file: RECONSTRUCTION.md]", prompt)
 
     def test_insertion_is_address_sorted(self) -> None:
         source = """/* Function start: 0x100 */

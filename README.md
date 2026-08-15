@@ -35,6 +35,7 @@ exports_dir = "ghidra"
 output_dir = "out/binary-recons"
 source_dirs = ["src"]
 declaration_files = ["include/*.h"]
+rule_profiles = ["c89", "msvc4-od"]
 prompt_files = ["RECONSTRUCTION.md"]
 compare_command = ["make", "compare-func", "FUNC={symbol}", "ADDR={address_hex}"]
 
@@ -60,6 +61,12 @@ not yet contain a definition. A declaration matching that symbol must exist in
 one of `declaration_files`, or `--prototype` must be supplied. Project-specific
 rules live in the configured prompt files and are included verbatim in each
 request.
+
+Reusable rules should not be copied into each target. Select packaged profiles
+with `rule_profiles`; the current profiles are `c89` and `msvc4-od`. Universal
+search rules remain in the engine, compiler/language rules live in named
+profiles, and `prompt_files` are reserved for facts unique to one target
+project.
 
 ## Run
 

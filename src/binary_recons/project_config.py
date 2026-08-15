@@ -2,13 +2,34 @@
 
 from __future__ import annotations
 
+import re
 import tomllib
+from importlib.resources import files
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 DEFAULT_CONFIG_NAME = "binary-recons.toml"
+PROFILE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+
+
+def load_rule_profile(name: str) -> str:
+    """Load one packaged, reusable rule profile by its stable name."""
+
+    if PROFILE_NAME_RE.fullmatch(name) is None:
+        raise RuntimeError("invalid rule profile name: %s" % name)
+    directory = files("binary_recons").joinpath("profiles")
+    resource = directory.joinpath(name + ".txt")
+    if not resource.is_file():
+        available = sorted(
+            path.name.removesuffix(".txt") for path in directory.iterdir()
+        )
+        raise RuntimeError(
+            "unknown rule profile %r; available profiles: %s"
+            % (name, ", ".join(available) or "none")
+        )
+    return resource.read_text(encoding="utf-8").strip()
 
 
 class SourceUnit(BaseModel):
@@ -39,6 +60,7 @@ class ProjectConfig(BaseModel):
     output_dir: Path = Path("out/binary-recons")
     source_dirs: list[Path] = Field(default_factory=lambda: [Path("src")])
     declaration_files: list[str] = Field(default_factory=list)
+    rule_profiles: list[str] = Field(default_factory=list)
     prompt_files: list[Path] = Field(default_factory=list)
     compare_command: list[str] = Field(min_length=1)
     source_units: list[SourceUnit] = Field(default_factory=list)
@@ -65,11 +87,18 @@ class ProjectConfig(BaseModel):
 
     def guidance(self, root: Path, character_limit: int = 16000) -> str:
         blocks: list[str] = []
+        for profile in self.rule_profiles:
+            blocks.append(
+                "[shared profile: %s]\n%s" % (profile, load_rule_profile(profile))
+            )
         for configured in self.prompt_files:
             path = self.resolve(root, configured)
             if not path.exists():
                 raise RuntimeError("missing project prompt file: %s" % path)
-            blocks.append("[%s]\n%s" % (configured, path.read_text(encoding="utf-8")))
+            blocks.append(
+                "[project file: %s]\n%s"
+                % (configured, path.read_text(encoding="utf-8"))
+            )
         text = "\n\n".join(blocks).strip()
         if not text:
             return "No additional target-project rules were supplied."

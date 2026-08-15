@@ -1,0 +1,19 @@
+MICROSOFT VISUAL C++ 4.x /Od PROFILE
+
+- Stay within syntax and library declarations accepted by Microsoft Visual C++
+  4.x, and preserve the configured C or C++ language mode and calling
+  convention.
+- With optimization disabled, statement order, expression evaluation order,
+  local declaration order, first assignment, and value lifetime are often
+  visible in the emitted instruction and stack-slot order. Treat those as
+  hypotheses to test through the compiler comparison.
+- Every local must still have a semantic role supported by the evidence. Do not
+  add padding, fake register-forcing variables, or dead statements.
+- Preserve signedness and type width when they determine MOVSX versus MOVZX,
+  16-bit versus 32-bit operations, or signed versus unsigned branches.
+- Prefer the target project's central declarations and historical platform
+  types over modern substitutes so imported API names and argument widths stay
+  correct.
+- Do not use inline assembly merely to force a match. It is appropriate only
+  when the original instructions themselves provide strong evidence of
+  hand-written assembly.
