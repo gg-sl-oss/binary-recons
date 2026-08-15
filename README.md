@@ -54,5 +54,12 @@ Use `--dry-run-prompt` to collect evidence and inspect the prompt without
 loading Qwen. Runs are recorded under
 `out/qwen-reconstruct/<address>/<timestamp>/` in the target repository.
 
+When a candidate reaches the compiler but fails with a compiler or linker
+diagnostic, the driver immediately makes one focused Qwen repair request using
+the failing definition, diagnostics, and central declaration evidence. This is
+bounded separately from the main search with `--compile-repair-attempts`
+(default `1`; use `0` to disable it). Repair prompts, completions, source, and
+compiler output are recorded beside the normal iteration logs.
+
 The test suite and GitHub CI use a synthetic HTTP server and require neither a
 local model nor `llama-server`.

@@ -23,6 +23,7 @@ from binary_recons.cli import main  # noqa: E402
 from binary_recons.llama_server import ManagedLlamaServer  # noqa: E402
 from binary_recons.models import (  # noqa: E402
     Candidate,
+    CandidateBatch,
     LlamaServerConfig,
     SearchConfig,
     ServerMode,
@@ -32,6 +33,7 @@ from binary_recons.repository import (  # noqa: E402
     current_function,
     replace_or_insert_function,
 )
+from binary_recons.search import ReconstructionSearch  # noqa: E402
 
 
 FAKE_SERVER = r"""
@@ -214,6 +216,119 @@ void OperationalLabel(void)
     def test_candidate_schema_accepts_large_functions(self) -> None:
         candidate = Candidate(source="x" * 6000)
         self.assertEqual(len(candidate.source), 6000)
+
+    def test_compiler_errors_are_distinguished_from_compare_failures(self) -> None:
+        self.assertTrue(
+            ProjectRepository.has_compiler_errors(
+                "sample.c(4) : error C2065: 'value' : undeclared identifier"
+            )
+        )
+        self.assertTrue(
+            ProjectRepository.has_compiler_errors(
+                "sample.c:4:12: error: use of undeclared identifier 'value'"
+            )
+        )
+        self.assertFalse(
+            ProjectRepository.has_compiler_errors("BUILD/COMPARE TIMED OUT")
+        )
+
+
+class CompileRepairTests(unittest.TestCase):
+    def test_compiler_failure_gets_one_focused_model_repair(self) -> None:
+        failing_candidate = """/* Function start: 0x401000 */
+int sample_function(void)
+{
+    return missing_value;
+}"""
+        repaired_candidate = """/* Function start: 0x401000 */
+int sample_function(void)
+{
+    return 7;
+}"""
+
+        class FakeServer:
+            def __init__(self, *args: object):
+                pass
+
+            def __enter__(self) -> FakeServer:
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                pass
+
+        class FakeGenerator:
+            repair_prompts: list[str] = []
+            repair_calls = 0
+
+            def __init__(self, *args: object):
+                pass
+
+            def generate(
+                self, prompt: str, iteration: int
+            ) -> tuple[CandidateBatch, dict[str, object]]:
+                return (
+                    CandidateBatch(candidates=[Candidate(source=failing_candidate)]),
+                    {"kind": "initial"},
+                )
+
+            def repair(
+                self,
+                prompt: str,
+                iteration: int,
+                candidate_index: int,
+                repair_attempt: int,
+            ) -> tuple[Candidate, dict[str, object]]:
+                self.repair_prompts.append(prompt)
+                type(self).repair_calls += 1
+                return Candidate(source=repaired_candidate), {"kind": "repair"}
+
+            def close(self) -> None:
+                pass
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            make_fixture_project(root)
+            repository = ProjectRepository(root)
+            target = repository.resolve_target(0x00401000)
+
+            def compare_candidate(*args: object) -> tuple[float | None, str]:
+                source = target.source_path.read_text(encoding="utf-8")
+                if "missing_value" in source:
+                    return (
+                        None,
+                        "sample.c(4) : error C2065: 'missing_value' : "
+                        "undeclared identifier",
+                    )
+                if "return 7;" in source:
+                    return 100.0, "Similarity: 100.00%"
+                raise AssertionError("unexpected candidate source")
+
+            repository.compare = compare_candidate  # type: ignore[method-assign]
+            config = SearchConfig(
+                seed=1,
+                max_iterations=1,
+                candidates_per_iteration=1,
+                compile_repair_attempts=1,
+            )
+            server_config = LlamaServerConfig(model_path=None)
+            with (
+                patch("binary_recons.search.ManagedLlamaServer", FakeServer),
+                patch("binary_recons.search.CandidateGenerator", FakeGenerator),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                result = ReconstructionSearch(
+                    repository, target, config, server_config
+                ).run()
+
+            self.assertTrue(result.target_reached)
+            self.assertEqual(result.score, 100.0)
+            self.assertEqual(result.attempts, 2)
+            self.assertEqual(FakeGenerator.repair_calls, 1)
+            self.assertIn("missing_value", FakeGenerator.repair_prompts[0])
+            self.assertIn("error C2065", FakeGenerator.repair_prompts[0])
+            self.assertIn("return 7;", target.source_path.read_text(encoding="utf-8"))
+            repair_logs = list(result.session_directory.glob("*-repair-01.c"))
+            self.assertEqual(len(repair_logs), 1)
 
 
 class LlamaServerTests(unittest.TestCase):

@@ -60,6 +60,12 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("--build-timeout", type=float, default=120.0)
     search.add_argument("--format-retries", type=int, default=1)
     search.add_argument(
+        "--compile-repair-attempts",
+        type=int,
+        default=1,
+        help="focused LLM repair calls after compiler errors (0 disables)",
+    )
+    search.add_argument(
         "--seed",
         type=_integer,
         help="default: target function address",
@@ -123,6 +129,7 @@ def main(argv: list[str] | None = None) -> int:
         request_timeout=args.request_timeout,
         build_timeout=args.build_timeout,
         format_retries=args.format_retries,
+        compile_repair_attempts=args.compile_repair_attempts,
         seed=args.seed if args.seed is not None else args.address,
         temperature=args.temperature,
         top_p=args.top_p,

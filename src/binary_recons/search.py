@@ -8,7 +8,7 @@ from pathlib import Path
 from .llama_server import ManagedLlamaServer
 from .model_client import CandidateGenerator
 from .models import LlamaServerConfig, SearchConfig, TargetSpec
-from .prompts import HistoryItem, build_prompt
+from .prompts import HistoryItem, build_compile_repair_prompt, build_prompt
 from .repository import (
     ProjectRepository,
     candidate_fingerprint,
@@ -46,6 +46,23 @@ class ReconstructionSearch:
         self.target = target
         self.config = search_config
         self.server_config = server_config
+
+    def _compile_candidate(
+        self,
+        candidate: str,
+        best_source: str,
+    ) -> tuple[str, float | None, str]:
+        trial_source = replace_or_insert_function(
+            best_source, self.target.address, candidate
+        )
+        atomic_write(self.target.source_path, trial_source)
+        try:
+            score, comparison = self.repository.compare(
+                self.target, self.config.build_timeout
+            )
+        finally:
+            atomic_write(self.target.source_path, best_source)
+        return trial_source, score, comparison
 
     def run(self, dry_run_prompt: bool = False) -> SearchResult:
         evidence = self.repository.collect_evidence(
@@ -192,16 +209,9 @@ class ReconstructionSearch:
                                 )
                                 continue
 
-                            trial_source = replace_or_insert_function(
-                                best_source, self.target.address, candidate
+                            trial_source, score, comparison = self._compile_candidate(
+                                candidate, best_source
                             )
-                            atomic_write(self.target.source_path, trial_source)
-                            try:
-                                score, comparison = self.repository.compare(
-                                    self.target, self.config.build_timeout
-                                )
-                            finally:
-                                atomic_write(self.target.source_path, best_source)
                             feedback = self.repository.compact_feedback(
                                 comparison, score
                             )
@@ -215,6 +225,154 @@ class ReconstructionSearch:
                                     candidate=candidate,
                                 )
                             )
+
+                            if (
+                                score is None
+                                and self.config.compile_repair_attempts > 0
+                                and self.repository.has_compiler_errors(comparison)
+                            ):
+                                for repair_attempt in range(
+                                    1, self.config.compile_repair_attempts + 1
+                                ):
+                                    repair_prompt = build_compile_repair_prompt(
+                                        self.target,
+                                        evidence,
+                                        self.config,
+                                        candidate,
+                                        feedback,
+                                        repair_attempt,
+                                    )
+                                    run_log.write_repair_prompt(
+                                        iteration,
+                                        index,
+                                        repair_attempt,
+                                        repair_prompt,
+                                    )
+                                    print(
+                                        "iteration %d candidate %d: requesting "
+                                        "compile repair %d/%d"
+                                        % (
+                                            iteration,
+                                            index,
+                                            repair_attempt,
+                                            self.config.compile_repair_attempts,
+                                        ),
+                                        flush=True,
+                                    )
+                                    repaired, repair_completion = generator.repair(
+                                        repair_prompt,
+                                        iteration,
+                                        index,
+                                        repair_attempt,
+                                    )
+                                    run_log.write_repair_generation(
+                                        iteration,
+                                        index,
+                                        repair_attempt,
+                                        repaired,
+                                        repair_completion,
+                                    )
+
+                                    repaired_candidate = repaired.source
+                                    repaired_fingerprint = candidate_fingerprint(
+                                        repaired_candidate
+                                    )
+                                    if repaired_fingerprint in seen:
+                                        feedback = (
+                                            "REPAIR SKIPPED: fingerprint already tried"
+                                        )
+                                        run_log.write_repair_candidate(
+                                            iteration,
+                                            index,
+                                            repair_attempt,
+                                            repaired_candidate,
+                                            feedback,
+                                        )
+                                        print(
+                                            "iteration %d candidate %d repair %d: "
+                                            "duplicate"
+                                            % (iteration, index, repair_attempt),
+                                            flush=True,
+                                        )
+                                        break
+
+                                    seen.add(repaired_fingerprint)
+                                    attempts += 1
+                                    candidate = repaired_candidate
+                                    fingerprint = repaired_fingerprint
+                                    try:
+                                        validate_candidate(candidate, self.target)
+                                    except ValueError as error:
+                                        score = None
+                                        feedback = (
+                                            "REPAIR REJECTED BEFORE BUILD: %s" % error
+                                        )
+                                        run_log.write_repair_candidate(
+                                            iteration,
+                                            index,
+                                            repair_attempt,
+                                            candidate,
+                                            feedback,
+                                        )
+                                        history.append(
+                                            HistoryItem(
+                                                fingerprint=fingerprint,
+                                                score=None,
+                                                candidate=candidate,
+                                            )
+                                        )
+                                        print(
+                                            "iteration %d candidate %d repair %d: "
+                                            "rejected"
+                                            % (iteration, index, repair_attempt),
+                                            flush=True,
+                                        )
+                                        continue
+
+                                    trial_source, score, comparison = (
+                                        self._compile_candidate(candidate, best_source)
+                                    )
+                                    feedback = self.repository.compact_feedback(
+                                        comparison, score
+                                    )
+                                    run_log.write_repair_candidate(
+                                        iteration,
+                                        index,
+                                        repair_attempt,
+                                        candidate,
+                                        comparison,
+                                    )
+                                    history.append(
+                                        HistoryItem(
+                                            fingerprint=fingerprint,
+                                            score=score,
+                                            candidate=candidate,
+                                        )
+                                    )
+                                    if score is not None:
+                                        print(
+                                            "iteration %d candidate %d repair %d: "
+                                            "similarity %.2f%%"
+                                            % (
+                                                iteration,
+                                                index,
+                                                repair_attempt,
+                                                score,
+                                            ),
+                                            flush=True,
+                                        )
+                                        break
+                                    if not self.repository.has_compiler_errors(
+                                        comparison
+                                    ):
+                                        print(
+                                            "iteration %d candidate %d repair %d: "
+                                            "build/compare failed"
+                                            % (iteration, index, repair_attempt),
+                                            flush=True,
+                                        )
+                                        break
+
                             batch_results.append(_AttemptResult(score, feedback))
 
                             if score is None:

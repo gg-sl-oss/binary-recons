@@ -106,6 +106,7 @@ class SearchConfig(BaseModel):
     request_timeout: float = Field(default=180.0, gt=0)
     build_timeout: float = Field(default=120.0, gt=0)
     format_retries: int = Field(default=1, ge=0, le=3)
+    compile_repair_attempts: int = Field(default=1, ge=0, le=3)
     seed: int
     temperature: float | None = Field(default=None, ge=0.0, le=2.0)
     top_p: float | None = Field(default=None, gt=0.0, le=1.0)

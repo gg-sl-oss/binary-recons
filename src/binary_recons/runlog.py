@@ -7,7 +7,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
-from .models import CandidateBatch, SearchConfig, TargetSpec
+from .models import Candidate, CandidateBatch, SearchConfig, TargetSpec
 from .utils import atomic_write, utc_now, write_json
 
 
@@ -80,3 +80,50 @@ class RunLog:
         prefix = self.directory / ("iteration-%02d-candidate-%02d" % (iteration, index))
         atomic_write(prefix.with_suffix(".c"), candidate.rstrip() + "\n")
         atomic_write(prefix.with_suffix(".compare.txt"), comparison.rstrip() + "\n")
+
+    def write_repair_prompt(
+        self,
+        iteration: int,
+        index: int,
+        repair_attempt: int,
+        prompt: str,
+    ) -> None:
+        prefix = self._repair_prefix(iteration, index, repair_attempt)
+        atomic_write(prefix.with_suffix(".prompt.txt"), prompt)
+
+    def write_repair_generation(
+        self,
+        iteration: int,
+        index: int,
+        repair_attempt: int,
+        candidate: Candidate,
+        completion: Any,
+    ) -> None:
+        prefix = self._repair_prefix(iteration, index, repair_attempt)
+        if hasattr(completion, "model_dump"):
+            completion = completion.model_dump(mode="json")
+        write_json(prefix.with_suffix(".candidate.json"), candidate)
+        write_json(prefix.with_suffix(".completion.json"), completion)
+
+    def write_repair_candidate(
+        self,
+        iteration: int,
+        index: int,
+        repair_attempt: int,
+        candidate: str,
+        comparison: str,
+    ) -> None:
+        prefix = self._repair_prefix(iteration, index, repair_attempt)
+        atomic_write(prefix.with_suffix(".c"), candidate.rstrip() + "\n")
+        atomic_write(prefix.with_suffix(".compare.txt"), comparison.rstrip() + "\n")
+
+    def _repair_prefix(
+        self,
+        iteration: int,
+        index: int,
+        repair_attempt: int,
+    ) -> Path:
+        return self.directory / (
+            "iteration-%02d-candidate-%02d-repair-%02d"
+            % (iteration, index, repair_attempt)
+        )

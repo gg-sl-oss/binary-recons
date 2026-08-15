@@ -11,7 +11,7 @@ SYSTEM_PROMPT = """\
 You are searching for the original C source form of one function compiled by
 Microsoft Visual C++ 4.20. Original assembly is authoritative and decompiled C
 is only a semantic hint. Infer changes yourself from mechanically supplied
-compiler comparisons. Populate only the requested structured candidate batch;
+compiler comparisons. Populate only the requested structured response;
 do not return analysis, Markdown, patches, or unrelated edits.
 """
 
@@ -121,4 +121,50 @@ LAST COMPILER / BINARY-COMP RESULT
 
 RECENT CANDIDATES ALREADY TRIED
 {_format_history(history, config.history_limit)}
+"""
+
+
+def build_compile_repair_prompt(
+    target: TargetSpec,
+    evidence: EvidenceBundle,
+    config: SearchConfig,
+    candidate: str,
+    compiler_feedback: str,
+    repair_attempt: int,
+) -> str:
+    think_control = "/no_think\n" if not config.thinking else ""
+    return f"""\
+{think_control}Repair the failing C definition below. Produce exactly one complete corrected C
+definition in the structured source field.
+
+REPAIR PASS
+- Attempt {repair_attempt} of {config.compile_repair_attempts}.
+- This is a narrow compilation repair, not a new reconstruction attempt.
+- Preserve the candidate's behavior, control-flow shape, meaningful locals,
+  signature, marker, and function name unless a compiler diagnostic requires a
+  source-level correction.
+- Fix every compiler diagnostic shown. Do not explain the fix.
+
+TARGET CONTRACT
+- Marker: /* Function start: 0x{target.address:X} */
+- Signature: {target.prototype}
+- Define only {target.symbol}; include no declarations or surrounding file text.
+
+COMPILATION CONSTRAINTS
+- Microsoft Visual C++ 4.20 C, not C++.
+- Put declarations before statements in each block.
+- Use exact identifiers and types from the supplied central declaration evidence.
+- Do not invent helpers, wrappers, globals, fields, types, macros, or includes.
+- No placeholders, omitted bodies, Markdown, inline assembly, exception handling,
+  unions, substructures, or unrelated edits.
+- Keep one C statement per line.
+
+COMPILER DIAGNOSTICS
+{compiler_feedback}
+
+MECHANICALLY DISCOVERED REFERENCED DECLARATIONS
+{evidence.declaration_evidence}
+
+FAILING C DEFINITION
+{candidate}
 """

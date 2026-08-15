@@ -8,7 +8,7 @@ import instructor
 from openai import OpenAI
 
 from .llama_server import ManagedLlamaServer
-from .models import CandidateBatch, SearchConfig
+from .models import Candidate, CandidateBatch, SearchConfig
 from .prompts import SYSTEM_PROMPT
 
 
@@ -35,6 +35,30 @@ class CandidateGenerator:
         self._openai.close()
 
     def generate(self, prompt: str, iteration: int) -> tuple[CandidateBatch, Any]:
+        return self._request(
+            prompt,
+            CandidateBatch,
+            self.config.seed + iteration,
+        )
+
+    def repair(
+        self,
+        prompt: str,
+        iteration: int,
+        candidate_index: int,
+        repair_attempt: int,
+    ) -> tuple[Candidate, Any]:
+        seed = (
+            self.config.seed + iteration * 1000 + candidate_index * 10 + repair_attempt
+        )
+        return self._request(prompt, Candidate, seed)
+
+    def _request(
+        self,
+        prompt: str,
+        response_model: type[Candidate] | type[CandidateBatch],
+        seed: int,
+    ) -> tuple[Any, Any]:
         self.server.ensure_alive()
         extra_body = {
             "top_k": self.config.top_k,
@@ -48,7 +72,7 @@ class CandidateGenerator:
         }
         batch, completion = self._instructor.chat.completions.create_with_completion(
             model=self.config.model,
-            response_model=CandidateBatch,
+            response_model=response_model,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
@@ -58,7 +82,7 @@ class CandidateGenerator:
             temperature=self.config.effective_temperature,
             top_p=self.config.effective_top_p,
             presence_penalty=self.config.effective_presence_penalty,
-            seed=self.config.seed + iteration,
+            seed=seed,
             extra_body=extra_body,
         )
         self.server.ensure_alive()

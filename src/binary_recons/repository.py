@@ -13,6 +13,12 @@ from .utils import read_text
 
 MARKER_RE = re.compile(r"/\*\s*Function start:\s*0x([0-9A-Fa-f]+)\s*\*/")
 SIMILARITY_RE = re.compile(r"Similarity:\s*([0-9]+(?:\.[0-9]+)?)%")
+COMPILER_ERROR_RE = re.compile(
+    r"(?:\bfatal error(?:\s+[A-Z]+\d+)?\b|"
+    r"\berror\s+(?:C|LNK|U)\d{4}\b|"
+    r":\s*error:)",
+    re.I | re.M,
+)
 
 
 def declaration_for_symbol(text: str, symbol: str) -> str | None:
@@ -404,3 +410,7 @@ class ProjectRepository:
         if not selected:
             selected = lines[-30:]
         return "\n".join(selected)[-6000:]
+
+    @staticmethod
+    def has_compiler_errors(output: str) -> bool:
+        return COMPILER_ERROR_RE.search(output) is not None
