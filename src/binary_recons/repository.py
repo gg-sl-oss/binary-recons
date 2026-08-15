@@ -329,21 +329,26 @@ class ProjectRepository:
 
     def support_file_map(self) -> dict[str, tuple[Path, str, str]]:
         result: dict[str, tuple[Path, str, str]] = {}
-        prototype_path = (
-            self.config.resolve(self.root, self.config.prototype_file).resolve()
-            if self.config.prototype_file is not None
-            else None
-        )
         for support in self.config.support_files:
             path = self.config.resolve(self.root, support.path).resolve()
             display = self._display_path(path)
             if display in result:
                 raise RuntimeError("duplicate resolved support file: %s" % display)
-            if path == prototype_path:
-                raise RuntimeError(
-                    "prototype file cannot also be a support file: %s" % display
-                )
             result[display] = (path, support.purpose, support.insertion)
+
+        if self.config.prototype_file is not None:
+            path = self.config.resolve(self.root, self.config.prototype_file).resolve()
+            display = self._display_path(path)
+            if display in result:
+                raise RuntimeError(
+                    "prototype file resolves to a configured support file: %s" % display
+                )
+            result[display] = (
+                path,
+                "Declarations for referenced non-target functions. The target "
+                "declaration is managed separately and must not be inserted here.",
+                "auto",
+            )
         return result
 
     def allowed_support_paths(self) -> set[str]:
@@ -355,17 +360,36 @@ class ProjectRepository:
             return (
                 "No support files are configured. supporting_insertions must be empty."
             )
-        blocks: list[str] = []
+        destinations = [
+            "Allowed support destinations:",
+            *(
+                "- %s: %s (insertion mode: %s)" % (display, purpose, insertion)
+                for display, (_, purpose, insertion) in configured.items()
+            ),
+        ]
+        blocks: list[str] = ["\n".join(destinations)]
+        prototype_path = (
+            self.config.resolve(self.root, self.config.prototype_file).resolve()
+            if self.config.prototype_file is not None
+            else None
+        )
         for display, (path, purpose, insertion) in configured.items():
             if not path.exists():
                 raise RuntimeError("missing configured support file: %s" % path)
-            content = read_text(path)
-            if len(content) > 6000:
+            if path == prototype_path:
                 content = (
-                    content[:3000]
-                    + "\n... mechanically truncated ...\n"
-                    + content[-2800:]
+                    "<full prototype header omitted so an unimplemented target's "
+                    "name and interface cannot leak; relevant declarations are "
+                    "supplied separately>"
                 )
+            else:
+                content = read_text(path)
+                if len(content) > 6000:
+                    content = (
+                        content[:3000]
+                        + "\n... mechanically truncated ...\n"
+                        + content[-2800:]
+                    )
             blocks.append(
                 "[allowed support file: %s]\n"
                 "Purpose: %s\nInsertion mode: %s\nCurrent content:\n%s"
@@ -729,6 +753,7 @@ class ProjectRepository:
             mode = (
                 "before-final-endif"
                 if path.suffix.lower() in {".h", ".hh", ".hpp", ".hxx"}
+                and re.search(r"(?m)^\s*#\s*endif\b", source)
                 else "append"
             )
         if mode == "append":

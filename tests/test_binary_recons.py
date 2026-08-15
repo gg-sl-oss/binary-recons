@@ -407,6 +407,10 @@ int ReadFixtureCounter(void)
                         path="src/globals.c",
                         content="FixtureCounter g_fixture_counter_00402030;",
                     ),
+                    SupportingInsertion(
+                        path="include/functions.h",
+                        content="void InspectFixtureCounter(int index);",
+                    ),
                 ],
             )
             candidate_target = target.with_candidate_contract(candidate)
@@ -429,6 +433,11 @@ int ReadFixtureCounter(void)
                 "int ReadFixtureCounter(void); /* 0x00401000 */",
                 rendered[(root / "include/functions.h").resolve()],
             )
+            self.assertTrue(
+                rendered[(root / "include/functions.h").resolve()].endswith(
+                    "void InspectFixtureCounter(int index);\n"
+                )
+            )
             types = rendered[(root / "include/types.h").resolve()]
             self.assertLess(types.index("FixtureCounter"), types.index("#endif"))
             self.assertIn(
@@ -440,6 +449,38 @@ int ReadFixtureCounter(void)
                     "FixtureCounter g_fixture_counter_00402030;\n"
                 )
             )
+
+    def test_target_prototype_cannot_be_supplied_as_supporting_content(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            make_fixture_project(root)
+            repository = ProjectRepository(root)
+            target = repository.resolve_target(0x00401000)
+            candidate = Candidate(
+                symbol="ComputeFixtureValue",
+                prototype="int ComputeFixtureValue(void)",
+                source="""/* Function start: 0x401000 */
+int ComputeFixtureValue(void)
+{
+    return 7;
+}""",
+                supporting_insertions=[
+                    SupportingInsertion(
+                        path="include/functions.h",
+                        content="int ComputeFixtureValue(void);",
+                    )
+                ],
+            )
+
+            with self.assertRaisesRegex(
+                ValueError, "target prototype belongs in the managed prototype file"
+            ):
+                validate_candidate(
+                    candidate,
+                    target.with_candidate_contract(candidate),
+                    set(repository.reserved_symbols(target)),
+                    repository.allowed_support_paths(),
+                )
 
     def test_applying_unchanged_workspace_preserves_file_timestamps(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

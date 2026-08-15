@@ -66,8 +66,9 @@ project's comparison authority.
 `support_files` are optional, explicitly writable files for declarations or
 definitions required by the target. Their `purpose` is included in the prompt.
 Model output can only add one bounded snippet to each configured file; it
-cannot replace existing contents or write any other path. Header snippets are
-inserted before the final `#endif`, while other files are appended. Set
+cannot replace existing contents or write any other path. Guarded-header
+snippets are inserted before the final `#endif`; unguarded headers and other
+files are appended. Set
 `insertion = "append"` or `insertion = "before-final-endif"` to override that
 automatic choice.
 
@@ -88,9 +89,10 @@ contract. For an unimplemented address, neither a name nor a prototype is put
 in the target contract: each structured candidate must infer and return a
 meaningful symbol, complete prototype, and matching definition from the raw
 evidence. The winning prototype is written to `prototype_file` with its address
-for use by later reconstructions. Existing definitions retain their established
-contract, and callers may still override it explicitly with `--symbol` and
-`--prototype`.
+for use by later reconstructions. The same file may receive declarations for
+referenced non-target functions, while validation keeps the target declaration
+driver-managed. Existing definitions retain their established contract, and
+callers may still override it explicitly with `--symbol` and `--prototype`.
 
 The prompt supplies already-selected function names as a reserved-name list,
 without exposing their interfaces, so independent model proposals cannot
