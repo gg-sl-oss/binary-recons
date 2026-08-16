@@ -314,9 +314,7 @@ int ReadFixtureValue(void)
                 if round_number != 1:
                     raise AssertionError("only one edit round was configured")
                 return (
-                    SimilarityPatch(
-                        edit=ExactEdit(old="return 7;", new="return 8;")
-                    ),
+                    SimilarityPatch(edit=ExactEdit(old="return 7;", new="return 8;")),
                     {},
                 )
 
@@ -329,10 +327,7 @@ int ReadFixtureValue(void)
             write_fixture(
                 root,
                 "analysis/FUN_00401000.disassembled.txt",
-                "Function: FUN_00401000\n"
-                "Address: 0x00401000\n\n"
-                "MOV EAX,0x8\n"
-                "RET\n",
+                "Function: FUN_00401000\nAddress: 0x00401000\n\nMOV EAX,0x8\nRET\n",
             )
             write_fixture(
                 root,
@@ -1171,9 +1166,7 @@ class StagedSearchTests(unittest.TestCase):
                 if any(value not in prompt for value in required):
                     raise AssertionError("rejection history did not survive")
                 return (
-                    SimilarityPatch(
-                        edit=ExactEdit(old="return 7;", new="return 10;")
-                    ),
+                    SimilarityPatch(edit=ExactEdit(old="return 7;", new="return 10;")),
                     {},
                 )
 
@@ -1190,8 +1183,7 @@ class StagedSearchTests(unittest.TestCase):
                 source = target.source_path.read_text(encoding="utf-8")
                 if "return 8;" in source:
                     return None, (
-                        "sample.c(4) : error C2065: 'synthetic' : "
-                        "undeclared identifier"
+                        "sample.c(4) : error C2065: 'synthetic' : undeclared identifier"
                     )
                 if "return 10;" in source:
                     score = 85.0

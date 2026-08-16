@@ -125,9 +125,9 @@ def _rejected_patch_feedback(
     attempted = json.dumps(patch.model_dump(mode="json"), separators=(",", ":"))
     if trial.score is not None:
         assert accepted.score is not None
-        outcome = (
-            "Trial similarity %.2f%% did not exceed the retained %.2f%%."
-            % (trial.score, accepted.score)
+        outcome = "Trial similarity %.2f%% did not exceed the retained %.2f%%." % (
+            trial.score,
+            accepted.score,
         )
     elif repository.has_compiler_errors(trial.output):
         rendered = trial.workspace.get(trial.target.source_path.resolve())
