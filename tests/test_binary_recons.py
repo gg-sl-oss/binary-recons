@@ -15,6 +15,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from instructor.core.exceptions import IncompleteOutputException
+
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
@@ -271,6 +273,7 @@ class RepositoryTests(unittest.TestCase):
         self.assertIn("--max-iterations", options)
         args = parser.parse_args(["--address", "0x401000"])
         self.assertEqual(args.max_callees, 2)
+        self.assertEqual(args.max_tokens, 512)
 
     def test_existing_definition_keeps_its_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -289,6 +292,116 @@ int ReadFixtureValue(void)
             target = ProjectRepository(root).resolve_target(0x00401000)
             self.assertEqual(target.symbol, "ReadFixtureValue")
             self.assertEqual(target.prototype, "int ReadFixtureValue(void)")
+
+    def test_address_only_cli_improves_an_existing_definition(self) -> None:
+        class FakeClient:
+            similarity_prompts: list[str] = []
+
+            def __init__(self, *args: object):
+                pass
+
+            def infer_contract(self, *args: object):
+                raise AssertionError("an existing definition keeps its contract")
+
+            def propose_symbols(self, *args: object):
+                raise AssertionError("an existing definition keeps its name")
+
+            def repair_compile(self, *args: object):
+                raise AssertionError("the existing definition compiles")
+
+            def improve_similarity(self, prompt: str, round_number: int):
+                type(self).similarity_prompts.append(prompt)
+                if round_number != 1:
+                    raise AssertionError("only one edit round was configured")
+                return (
+                    SimilarityPatch(
+                        edit=ExactEdit(old="return 7;", new="return 8;")
+                    ),
+                    {},
+                )
+
+            def close(self) -> None:
+                pass
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            make_fixture_project(root, "return 8;")
+            write_fixture(
+                root,
+                "analysis/FUN_00401000.disassembled.txt",
+                "Function: FUN_00401000\n"
+                "Address: 0x00401000\n\n"
+                "MOV EAX,0x8\n"
+                "RET\n",
+            )
+            write_fixture(
+                root,
+                "src/sample.c",
+                """/* Function start: 0x401000 */
+int ReadFixtureValue(void)
+{
+    return 7;
+}
+""",
+            )
+            write_fixture(
+                root,
+                "include/functions.h",
+                "int ReadFixtureValue(void); /* 0x00401000 */\n"
+                "void ExistingFixtureAction(void); /* 0x00402000 */\n",
+            )
+
+            def compare(
+                repository_self: ProjectRepository,
+                target: object,
+                timeout: object,
+            ):
+                source = (root / "src/sample.c").read_text(encoding="utf-8")
+                score = 90.0 if "return 8;" in source else 70.0
+                return score, (
+                    "Comparison for function ReadFixtureValue\n"
+                    "0x401000: MOV EAX,0x7 | 0x501000: MOV EAX,0x8\n"
+                    "Similarity: %.2f%%" % score
+                )
+
+            with (
+                patch.object(ProjectRepository, "compare", compare),
+                patch("binary_recons.search.ManagedLlamaServer", FakeManagedServer),
+                patch("binary_recons.search.StructuredModelClient", FakeClient),
+                patch("binary_recons.cli.DEFAULT_MODEL_PATH", None),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                result = main(
+                    [
+                        "--project-root",
+                        str(root),
+                        "--address",
+                        "0x401000",
+                        "--max-edits",
+                        "1",
+                    ]
+                )
+
+            self.assertEqual(result, 0)
+            self.assertEqual(len(FakeClient.similarity_prompts), 1)
+            prompt = FakeClient.similarity_prompts[0]
+            self.assertIn("DIFF ORIENTATION", prompt)
+            self.assertIn("ORIGINAL FUNCTION ASSEMBLY", prompt)
+            self.assertIn("MOV EAX,0x8", prompt)
+            self.assertIn("GHIDRA DECOMPILATION", prompt)
+            self.assertIn("return 8;", prompt)
+            self.assertIn("CURRENT SOURCE", prompt)
+            self.assertIn("return 7;", prompt)
+            source = (root / "src/sample.c").read_text(encoding="utf-8")
+            self.assertIn("int ReadFixtureValue(void)", source)
+            self.assertIn("return 8;", source)
+            self.assertFalse(
+                list(
+                    (root / "artifacts/reconstruction/local-model/00401000").glob(
+                        "*/contract.prompt.txt"
+                    )
+                )
+            )
 
     def test_reopen_contract_hides_the_existing_weak_name(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1007,6 +1120,112 @@ class StagedSearchTests(unittest.TestCase):
             )
             self.assertFalse(decision["accepted"])
 
+    def test_rejected_similarity_trial_guides_the_next_edit(self) -> None:
+        class FakeClient:
+            similarity_prompts: list[str] = []
+
+            def __init__(self, *args: object):
+                pass
+
+            def infer_contract(self, prompt: str):
+                return (
+                    ContractProposal(
+                        symbol="ReadFixtureValue",
+                        prototype="int ReadFixtureValue(void)",
+                    ),
+                    {},
+                )
+
+            def propose_symbols(self, *args: object):
+                raise AssertionError("unexpected name repair")
+
+            def repair_compile(self, *args: object):
+                raise AssertionError("the retained candidate compiles")
+
+            def improve_similarity(self, prompt: str, round_number: int):
+                type(self).similarity_prompts.append(prompt)
+                if round_number == 1:
+                    return (
+                        SimilarityPatch(
+                            edit=ExactEdit(old="return 7;", new="return 8;")
+                        ),
+                        {},
+                    )
+                if round_number == 2:
+                    required = (
+                        "Keep CURRENT SOURCE unchanged",
+                        "return 8;",
+                        "error C2065",
+                    )
+                    if any(value not in prompt for value in required):
+                        raise AssertionError("rejected-trial evidence is incomplete")
+                    if prompt.index("error C2065") >= prompt.index("TASK"):
+                        raise AssertionError("rejected compiler feedback must be early")
+                    return (
+                        SimilarityPatch(
+                            edit=ExactEdit(old="return 7;", new="return 9;")
+                        ),
+                        {},
+                    )
+                required = ("return 8;", "error C2065", "return 9;", "65.00%")
+                if any(value not in prompt for value in required):
+                    raise AssertionError("rejection history did not survive")
+                return (
+                    SimilarityPatch(
+                        edit=ExactEdit(old="return 7;", new="return 10;")
+                    ),
+                    {},
+                )
+
+            def close(self) -> None:
+                pass
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            make_fixture_project(root)
+            repository = ProjectRepository(root)
+            target = repository.resolve_target(0x00401000)
+
+            def compare(*args: object):
+                source = target.source_path.read_text(encoding="utf-8")
+                if "return 8;" in source:
+                    return None, (
+                        "sample.c(4) : error C2065: 'synthetic' : "
+                        "undeclared identifier"
+                    )
+                if "return 10;" in source:
+                    score = 85.0
+                elif "return 9;" in source:
+                    score = 65.0
+                else:
+                    score = 70.0
+                return score, (
+                    "Comparison for function ReadFixtureValue\n"
+                    "0x401000: ADD EAX,1 | 0x501000: SUB EAX,1\n"
+                    "Similarity: %.2f%%" % score
+                )
+
+            repository.compare = compare  # type: ignore[method-assign]
+            with (
+                patch("binary_recons.search.ManagedLlamaServer", FakeManagedServer),
+                patch("binary_recons.search.StructuredModelClient", FakeClient),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                result = ReconstructionSearch(
+                    repository,
+                    target,
+                    SearchConfig(seed=target.address, max_edits=3),
+                    LlamaServerConfig(model_path=None, preset=ModelPreset.QWEN),
+                ).run()
+
+            self.assertTrue(result.target_reached)
+            self.assertEqual(result.score, 85.0)
+            self.assertEqual(len(FakeClient.similarity_prompts), 3)
+            source = target.source_path.read_text(encoding="utf-8")
+            self.assertIn("return 10;", source)
+            self.assertNotIn("return 8;", source)
+            self.assertNotIn("return 9;", source)
+
     def test_colliding_contract_name_gets_a_small_name_only_repair(self) -> None:
         class FakeClient:
             symbol_calls = 0
@@ -1224,6 +1443,46 @@ int ReadFixtureValue(void)
 
 
 class StructuredClientTests(unittest.TestCase):
+    def test_incomplete_structured_output_becomes_a_model_request_error(self) -> None:
+        class FakeCompletions:
+            def create_with_completion(self, **kwargs: object):
+                raise IncompleteOutputException()
+
+        class FakeInstructor:
+            class Chat:
+                completions = FakeCompletions()
+
+            chat = Chat()
+
+        class FakeOpenAI:
+            def close(self) -> None:
+                pass
+
+        class FakeServer:
+            base_url = "http://127.0.0.1:8080/v1"
+            config = LlamaServerConfig(model_path=None, preset=ModelPreset.QWEN)
+
+            def ensure_alive(self) -> None:
+                pass
+
+        with (
+            patch("binary_recons.model_client.OpenAI", return_value=FakeOpenAI()),
+            patch(
+                "binary_recons.model_client.instructor.from_openai",
+                return_value=FakeInstructor(),
+            ),
+        ):
+            client = StructuredModelClient(
+                FakeServer(),  # type: ignore[arg-type]
+                SearchConfig(seed=1),
+            )
+            with self.assertRaisesRegex(
+                ModelRequestError,
+                "similarity edit request failed",
+            ):
+                client.improve_similarity("edit prompt", 1)
+            client.close()
+
     def test_qwen_requests_use_json_schema_non_thinking_and_bounded_sampling(
         self,
     ) -> None:
@@ -1238,6 +1497,13 @@ class StructuredClientTests(unittest.TestCase):
                         ContractProposal(
                             symbol="ReadFixtureValue",
                             prototype="int ReadFixtureValue(void)",
+                        ),
+                        {},
+                    )
+                if response_model is SimilarityPatch:
+                    return (
+                        SimilarityPatch(
+                            edit=ExactEdit(old="return 7;", new="return 8;")
                         ),
                         {},
                     )
@@ -1288,9 +1554,11 @@ class StructuredClientTests(unittest.TestCase):
             )
             client.infer_contract("contract prompt")
             client.propose_symbols("name prompt", 1)
+            client.improve_similarity("first edit prompt", 1)
+            client.improve_similarity("retry edit prompt", 2)
             client.close()
 
-        contract_call, naming_call = calls
+        contract_call, naming_call, first_edit_call, retry_edit_call = calls
         self.assertEqual(contract_call["max_tokens"], 192)
         self.assertEqual(contract_call["temperature"], 0.2)
         self.assertEqual(contract_call["presence_penalty"], 0.0)
@@ -1303,6 +1571,12 @@ class StructuredClientTests(unittest.TestCase):
         self.assertEqual(naming_call["max_tokens"], 160)
         self.assertEqual(naming_call["temperature"], 0.7)
         self.assertEqual(naming_call["presence_penalty"], 1.5)
+        self.assertEqual(first_edit_call["max_tokens"], 320)
+        self.assertEqual(first_edit_call["temperature"], 0.2)
+        self.assertEqual(first_edit_call["presence_penalty"], 0.0)
+        self.assertEqual(retry_edit_call["max_tokens"], 320)
+        self.assertEqual(retry_edit_call["temperature"], 0.7)
+        self.assertEqual(retry_edit_call["presence_penalty"], 1.5)
 
 
 class LlamaServerTests(unittest.TestCase):

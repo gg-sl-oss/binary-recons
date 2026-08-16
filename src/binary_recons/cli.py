@@ -86,7 +86,7 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument(
         "--max-tokens",
         type=int,
-        default=320,
+        default=512,
         help="hard output-token cap; each staged request applies a lower cap",
     )
     search.add_argument(

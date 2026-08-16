@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 import instructor
-from instructor.core.exceptions import InstructorRetryException
+from instructor.core.exceptions import InstructorError
 from openai import OpenAI, OpenAIError
 from pydantic import BaseModel
 
@@ -91,7 +91,8 @@ class StructuredModelClient:
             prompt,
             SimilarityPatch,
             seed=self.config.seed + 2000 + round_number,
-            max_tokens=192,
+            max_tokens=512,
+            diverse=round_number > 1,
         )
 
     def _request(
@@ -155,7 +156,7 @@ class StructuredModelClient:
                     extra_body=extra_body,
                 )
             )
-        except (InstructorRetryException, OpenAIError) as error:
+        except (InstructorError, OpenAIError) as error:
             raise ModelRequestError("%s request failed: %s" % (stage, error)) from error
         self.server.ensure_alive()
         return result, completion

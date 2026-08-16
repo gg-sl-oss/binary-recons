@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -111,6 +112,38 @@ def _quality(
     if score is not None:
         return 1, score
     return 0, float(-repository.compiler_error_count(output))
+
+
+def _rejected_patch_feedback(
+    repository: ProjectRepository,
+    accepted: _Evaluation,
+    trial: _Evaluation,
+    patch: SourcePatch,
+) -> str:
+    """Give the next bounded turn enough measured evidence to avoid repetition."""
+
+    attempted = json.dumps(patch.model_dump(mode="json"), separators=(",", ":"))
+    if trial.score is not None:
+        assert accepted.score is not None
+        outcome = (
+            "Trial similarity %.2f%% did not exceed the retained %.2f%%."
+            % (trial.score, accepted.score)
+        )
+    elif repository.has_compiler_errors(trial.output):
+        rendered = trial.workspace.get(trial.target.source_path.resolve())
+        outcome = "Trial did not compile:\n" + repository.compact_compile_feedback(
+            trial.output,
+            rendered,
+        )
+    else:
+        outcome = "Trial comparison failed:\n" + repository.compact_feedback(
+            trial.output,
+            None,
+        )
+    return (
+        "Keep CURRENT SOURCE unchanged; this measured trial was rejected.\n"
+        "Attempted patch: %s\n%s" % (attempted, outcome)
+    )
 
 
 class ReconstructionSearch:
@@ -596,7 +629,7 @@ class ReconstructionSearch:
                         if working is None:
                             raise RuntimeError("no reconstruction seed is available")
 
-                        previous_rejection = ""
+                        rejection_history: list[str] = []
                         for round_number in range(1, self.config.max_edits + 1):
                             if (
                                 working.score is not None
@@ -622,7 +655,7 @@ class ReconstructionSearch:
                                     evidence,
                                     working.candidate,
                                     feedback,
-                                    previous_rejection,
+                                    "\n\n".join(rejection_history[-3:]),
                                 )
                                 run_log.write_edit_prompt(round_number, kind, prompt)
                                 print(
@@ -644,7 +677,7 @@ class ReconstructionSearch:
                                     evidence,
                                     working.candidate,
                                     feedback,
-                                    previous_rejection,
+                                    "\n\n".join(rejection_history[-3:]),
                                 )
                                 run_log.write_edit_prompt(round_number, kind, prompt)
                                 print(
@@ -671,16 +704,22 @@ class ReconstructionSearch:
                                 working.candidate.symbol,
                             )
                             if not patch.edits and not patch.identifier_replacements:
-                                previous_rejection = "; ".join(rejected) or (
-                                    "the model returned an empty patch"
+                                rejection = (
+                                    "Keep CURRENT SOURCE unchanged. Attempted patch: %s\n%s"
+                                    % (
+                                        raw_patch.model_dump_json(),
+                                        "; ".join(rejected)
+                                        or "the model returned an empty patch",
+                                    )
                                 )
+                                rejection_history.append(rejection)
                                 run_log.write_edit_result(
                                     round_number,
                                     kind,
                                     None,
                                     patch,
                                     rejected,
-                                    "PATCH NOT APPLIED: " + previous_rejection,
+                                    "PATCH NOT APPLIED: " + rejection,
                                     None,
                                     False,
                                     {},
@@ -710,14 +749,19 @@ class ReconstructionSearch:
                                 )
                                 attempts += 1
                             except ValueError as error:
-                                previous_rejection = "candidate rejected: %s" % error
+                                rejection = (
+                                    "Keep CURRENT SOURCE unchanged. Attempted patch: %s\n"
+                                    "Candidate rejected before measurement: %s"
+                                    % (patch.model_dump_json(), error)
+                                )
+                                rejection_history.append(rejection)
                                 run_log.write_edit_result(
                                     round_number,
                                     kind,
                                     None,
                                     patch,
                                     rejected,
-                                    previous_rejection,
+                                    rejection,
                                     None,
                                     False,
                                     {},
@@ -749,9 +793,13 @@ class ReconstructionSearch:
                                 patch_metrics(trial.candidate, patch),
                             )
                             if not accepted:
-                                previous_rejection = (
-                                    "the trial did not reduce compiler errors or "
-                                    "increase binary-comp similarity"
+                                rejection_history.append(
+                                    _rejected_patch_feedback(
+                                        self.repository,
+                                        working,
+                                        trial,
+                                        patch,
+                                    )
                                 )
                                 print(
                                     "edit %d: measured result rejected" % round_number
@@ -759,7 +807,7 @@ class ReconstructionSearch:
                                 continue
 
                             working = trial
-                            previous_rejection = ""
+                            rejection_history.clear()
                             if trial.score is not None and (
                                 best_evaluation is None
                                 or best_evaluation.score is None

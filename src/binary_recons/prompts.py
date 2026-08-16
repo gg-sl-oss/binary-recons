@@ -121,6 +121,9 @@ def build_compile_patch_prompt(
 COMPILER FEEDBACK FOR THE CURRENT DRAFT
 {compiler_feedback.strip()}
 
+PREVIOUS PATCH REJECTION
+{_excerpt(rejection, 3500)}
+
 TASK
 Fix only the first compiler root cause with the smallest possible source patch.
 This is a COMPILE-ONLY pass: do not inspect or tune assembly, rename the target,
@@ -159,9 +162,6 @@ DIRECT-CALLEE EVIDENCE
 PROJECT AND COMPILER RULES
 {_excerpt(evidence.project_guidance, 3500)}
 
-PREVIOUS PATCH REJECTION
-{rejection}
-
 Target address 0x{target.address:08X} is for evidence selection only. Return only
 the structured source patch.
 """
@@ -174,24 +174,37 @@ def build_similarity_patch_prompt(
     comparison_feedback: str,
     previous_rejection: str = "",
 ) -> str:
-    """Ask for one source-form experiment against a compact assembly diff."""
+    """Ask for one evidence-backed source experiment against the current diff."""
 
     rejection = previous_rejection or "No earlier patch was rejected."
     return f"""\
 LATEST BINARY-COMP FEEDBACK (AUTHORITATIVE)
 {comparison_feedback.strip()}
 
+DIFF ORIENTATION
+Each comparison row is `current compiler output | original binary`. Relocated
+instruction and data addresses are not source mismatches.
+
+PREVIOUS PATCH REJECTION
+{_excerpt(rejection, 3500)}
+
 TASK
 The function compiles. Improve only the earliest important instruction-shape,
 control-flow, operand-width, register-lifetime, or stack-offset mismatch with ONE
 small exact source edit. Return PATCH DATA ONLY. Never regenerate the function,
 rename it, change its prototype, add a helper/dummy variable, or edit another
-file. Ignore relocated code and data addresses.
+file. Ignore relocated code and data addresses. Prefer a missing or extra source
+operation evidenced by the decompilation and assembly—such as an index stride,
+arithmetic scale, cast, temporary, or branch shape—over a semantic-only rename.
 
 PATCH CONTRACT
 - The exact `old` text must occur verbatim in the current source.
 - Preserve brace balance, the address marker, and unrelated statements.
 - Use mode `once` unless all occurrences are independently evidenced as wrong.
+- A rejected patch is blacklisted. Never repeat its `old`/`new` edit; choose a
+  different source region or a materially different source shape.
+- Do not spend a turn on a global/field rename or constant-address substitution
+  when it leaves the compiler's instruction shape unchanged.
 - The driver will compile the trial transactionally and reject it unless its
   measured similarity strictly increases.
 
@@ -201,14 +214,26 @@ LOCKED FUNCTION CONTRACT
 CURRENT SOURCE
 {candidate.source}
 
+ORIGINAL FUNCTION ASSEMBLY (AUTHORITATIVE)
+{_excerpt(evidence.original_assembly, 9000)}
+
+GHIDRA DECOMPILATION (SEMANTIC HINT, NOT AUTHORITATIVE)
+{_excerpt(evidence.decompiler_hint, 7000)}
+
+RELEVANT EXISTING DECLARATIONS
+{_excerpt(evidence.declaration_evidence, 5000)}
+
+DIRECT-CALLEE EVIDENCE
+{_excerpt(evidence.callee_evidence, 2500)}
+
+MECHANICALLY DISCOVERED REFERENCED STRINGS
+{_excerpt(evidence.string_evidence, 1000)}
+
 COMPILER/TOOLCHAIN
 {evidence.compiler}
 
 PROJECT AND COMPILER RULES
 {_excerpt(evidence.project_guidance, 3500)}
-
-PREVIOUS PATCH REJECTION
-{rejection}
 
 Target address 0x{target.address:08X} is for evidence selection only. Return only
 the structured single edit.

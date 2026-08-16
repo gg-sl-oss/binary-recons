@@ -361,7 +361,7 @@ class SearchConfig(BaseModel):
     model: str = "local-model"
     max_edits: int = Field(default=4, ge=0, le=20)
     target_score: float = Field(default=80.0, ge=0.0, le=100.0)
-    max_tokens: int = Field(default=320, ge=64, le=2000)
+    max_tokens: int = Field(default=512, ge=64, le=2000)
     reasoning_effort: Literal["none", "low", "medium"] = "none"
     max_callees: int = Field(default=2, ge=0, le=32)
     request_timeout: float = Field(default=60.0, gt=0)
