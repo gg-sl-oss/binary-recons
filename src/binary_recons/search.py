@@ -299,7 +299,10 @@ class ReconstructionSearch:
             stage = "similarity-edit"
             path = run_log.directory / "edit-01.similarity.prompt.txt"
         elif self.repository.is_repairable_build_failure(evaluation.output):
-            feedback = self.repository.compact_feedback(evaluation.output, None)
+            feedback = self.repository.compact_compile_feedback(
+                evaluation.output,
+                evaluation.workspace.get(evaluation.target.source_path),
+            )
             prompt = build_compile_patch_prompt(
                 evaluation.target,
                 evidence,
@@ -608,9 +611,11 @@ class ReconstructionSearch:
                                     stop_reason = "non-compiler-build-failure"
                                     break
                                 kind = "compile"
-                                feedback = self.repository.compact_feedback(
+                                feedback = self.repository.compact_compile_feedback(
                                     working.output,
-                                    None,
+                                    working.workspace.get(
+                                        working.target.source_path,
+                                    ),
                                 )
                                 prompt = build_compile_patch_prompt(
                                     working.target,

@@ -864,6 +864,42 @@ class ProjectRepository:
         return "\n".join(selected)[-6000:]
 
     @staticmethod
+    def compact_compile_feedback(output: str, rendered_source: str | None) -> str:
+        """Pair the first fatal diagnostic with its exact rendered source line."""
+
+        feedback = ProjectRepository.compact_feedback(output, None)
+        if rendered_source is None:
+            return feedback
+        diagnostic = next(
+            (line for line in output.splitlines() if COMPILER_ERROR_RE.search(line)),
+            None,
+        )
+        if diagnostic is None:
+            return feedback
+        line_match = re.search(r"\((\d+)\)\s*:", diagnostic)
+        if line_match is None:
+            line_match = re.search(r":(\d+)(?::\d+)?:\s*(?:fatal\s+)?error", diagnostic)
+        if line_match is None:
+            return feedback
+        line_number = int(line_match.group(1))
+        source_lines = rendered_source.splitlines()
+        if line_number < 1 or line_number > len(source_lines):
+            return feedback
+        beginning = max(1, line_number - 2)
+        ending = min(len(source_lines), line_number + 2)
+        nearby = "\n".join(
+            "%d: %s" % (number, source_lines[number - 1])
+            for number in range(beginning, ending + 1)
+        )
+        return (
+            feedback
+            + "\n\nFIRST BLOCKING SOURCE FILE LINE (verbatim):\n"
+            + source_lines[line_number - 1]
+            + "\n\nNUMBERED NEARBY SOURCE (numbers are annotations):\n"
+            + nearby
+        )[-9000:]
+
+    @staticmethod
     def compact_similarity_feedback(output: str) -> str:
         """Keep mismatched instruction rows while normalizing relocated addresses."""
 

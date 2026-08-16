@@ -134,6 +134,8 @@ PATCH CONTRACT
   is independently wrong.
 - Use identifier replacements only for simple existing-token renames.
 - Pointer arithmetic and imperfect types may remain when they compile.
+- The exact first blocking source line is supplied above. Patch that line or a
+  token used by it; do not spend this turn cleaning up an unrelated warning.
 - Prefer supplied declarations. If an unresolved DAT/global has no declaration,
   replace that identifier with a short typed absolute-address lvalue expression.
 - Do not add behavior, a helper, a declaration, an include, a macro, Markdown,

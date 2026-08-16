@@ -591,6 +591,11 @@ Similarity: 70.00%
         compile_feedback = ProjectRepository.compact_feedback(compiler, None)
         self.assertTrue(compile_feedback.startswith("sample.c(4) : error C2065"))
         self.assertNotIn("warning C4013", compile_feedback)
+        rendered = "one\ntwo\nwarning source\nreturn missing;\nfive\n"
+        focused = ProjectRepository.compact_compile_feedback(compiler, rendered)
+        self.assertIn("FIRST BLOCKING SOURCE FILE LINE", focused)
+        self.assertIn("return missing;", focused)
+        self.assertIn("3: warning source", focused)
         compact = ProjectRepository.compact_similarity_feedback(comparison)
         self.assertIn("ADD EAX,1", compact)
         self.assertNotIn("MOV EAX", compact)
