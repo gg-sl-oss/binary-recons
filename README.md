@@ -2,26 +2,55 @@
 
 [![CI](https://github.com/gg-sl-oss/binary-recons/actions/workflows/ci.yml/badge.svg)](https://github.com/gg-sl-oss/binary-recons/actions/workflows/ci.yml)
 
-`binary-recons` runs a bounded generate, compile, and assembly-compare loop for
-recovering one source function at a time with a local language model. Python is
-the restricted driver: the model receives a structured prompt, proposes one
-typed change set, and never receives shell or unrestricted filesystem tools.
+`binary-recons` turns a Ghidra C decompilation into a compiling source function,
+then makes a few measured source-form edits against the original assembly. It is
+designed for fast local-model passes: Python owns the workflow and Qwen receives
+one small, typed decision at a time.
 
-Target-specific layout, compiler details, reconstruction rules, and comparison
-commands belong in the target repository. The Python package contains no
-conventions for a particular binary or source tree.
+The validated default model is
+[`unsloth/Qwen3.8-27B-GGUF`](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF),
+using the BF16 GGUF. Other llama.cpp models remain usable, but the prompts,
+sampling, and edit sizes are tuned for Qwen.
+
+## How the workflow works
+
+For a new function, one run performs these stages:
+
+1. Read the original assembly, Ghidra decompilation, referenced declarations,
+   strings, callees, and project rules.
+2. Ask Qwen only for a meaningful function name and complete C prototype.
+3. Build the first candidate mechanically from Ghidra: align parameter names,
+   normalize configured historical-C spellings, map address-backed declarations,
+   and give unresolved `DAT_<address>` values a typed absolute-address fallback.
+4. Apply the candidate as a transaction, compile it, and run the project's
+   configured assembly comparison command.
+5. If compilation fails, put the compact compiler diagnostics first in a Qwen
+   request for at most one exact edit and eight whole-token replacements.
+6. Once it compiles, give Qwen a compact normalized assembly diff and request one
+   exact source-form edit.
+7. Accept a trial only when it reduces the compiler-error count or strictly
+   increases measured similarity. Otherwise roll it back. Stop at the target or
+   after the bounded edit budget.
+
+Existing functions keep their established name and prototype and start at stage
+4. The model never receives shell access, unrestricted filesystem tools, or an
+agent loop. Instructor constrains every response with a JSON schema, and Python
+is the only component that writes, builds, compares, accepts, or rolls back.
+
+The Ghidra export is the sole candidate seed. There is no alternate draft-source
+input and no full-function generation batch in the normal path.
 
 ## Install
 
-Python 3.11+ is required. Managed model serving also requires `llama-server`.
+Python 3.11+ is required. Managed model serving also requires a recent
+`llama-server` on `PATH`.
 
 ```sh
 python3 -m pip install -e /path/to/binary-recons
 ```
 
-The installed `binary-recons` command can be invoked from any directory. CI and
-the unit tests use a synthetic HTTP server, so installing or downloading a
-model is not required to test the package.
+The installed `binary-recons` command works from any directory. CI and the unit
+tests use synthetic projects and servers, so they do not download or run Qwen.
 
 ## Configure a target project
 
@@ -41,40 +70,15 @@ rule_profiles = ["c89", "msvc4-od"]
 prompt_files = ["RECONSTRUCTION.md"]
 compare_command = ["make", "compare-func", "FUNC={symbol}", "ADDR={address_hex}"]
 
-[[support_files]]
-path = "include/types.h"
-purpose = "Shared source-level type declarations."
-
-[[support_files]]
-path = "include/globals.h"
-purpose = "Extern declarations for evidenced globals."
-
-[[support_files]]
-path = "src/globals.c"
-purpose = "Definitions matching newly declared globals."
-
 [[source_units]]
 path = "src/game.c"
 start = 0x00401000
 end = 0x0040ffff
 ```
 
-The comparison command may use `{symbol}`, `{address}`, and `{address_hex}`.
-It must compile the current source and print a `Similarity: N%` line from the
+The comparison command may use `{symbol}`, `{address}`, and `{address_hex}`. It
+must compile the current source and print a `Similarity: N%` line from the
 project's comparison authority.
-
-`support_files` are optional, explicitly writable files for declarations or
-definitions required by the target. Their `purpose` is included in the prompt.
-Model output can only add one bounded snippet to each configured file; it
-cannot replace existing contents or write any other path. Guarded-header
-snippets are inserted before the final `#endif`; unguarded headers and other
-files are appended. Set
-`insertion = "append"` or `insertion = "before-final-endif"` to override that
-automatic choice.
-
-When `strings_file` is configured, only entries whose addresses occur in the
-target assembly or decompilation are added to the prompt. This supplies exact
-literal text without adding unrelated context.
 
 Assembly and decompiler exports use these names by default:
 
@@ -83,91 +87,80 @@ ghidra/FUN_00401000.disassembled.txt
 ghidra/FUN_00401000.decompiled.txt
 ```
 
-The assembly export should begin with `Function: <label>` when the source does
-not yet contain a definition, but that export label is not treated as a source
-contract. For an unimplemented address, neither a name nor a prototype is put
-in the target contract: each structured candidate must infer and return a
-meaningful symbol, complete prototype, and matching definition from the raw
-evidence. The winning prototype is written to `prototype_file` with its address
-for use by later reconstructions. The same file may receive declarations for
-referenced non-target functions, while validation keeps the target declaration
-driver-managed. Existing definitions retain their established contract, and
-callers may still override it explicitly with `--symbol` and `--prototype`.
-Use `--reopen-contract` to ask the model for a replacement when an earlier
-inferred contract is weak; the old name and interface are excluded from the new
-prompt. Bare mechanism labels such as `DialogProc`, `WindowProc`, or `Helper`
-are rejected for inferred contracts.
+Reusable language/compiler rules belong in packaged `rule_profiles`; facts
+unique to a target belong in `prompt_files`. The current shared profiles are
+`c89` and `msvc4-od`.
 
-The prompt supplies already-selected function names as a reserved-name list,
-without exposing their interfaces, so independent model proposals cannot
-collide. If a model omits the required address marker, Python adds that
-mechanical comment before validation; a wrong or duplicate marker is still
-rejected. A candidate may also return a complete list of supporting type/global
-insertions, but only for the configured support files.
+`support_files` remain an optional transaction boundary for resuming an older
+logged `Candidate` that already contains bounded supporting insertions. The
+normal compile-first workflow does not ask Qwen to create header, global, helper,
+or wrapper edits; it writes only the target definition and the driver-managed
+prototype.
 
-Project-specific rules live in the configured prompt files and are included
-verbatim in each request.
+## Run with Qwen
 
-Reusable rules should not be copied into each target. Select packaged profiles
-with `rule_profiles`; the current profiles are `c89` and `msvc4-od`. Universal
-search rules remain in the engine, compiler/language rules live in named
-profiles, and `prompt_files` are reserved for facts unique to one target
-project.
-
-## Run
-
-Set a GGUF once, then run against any configured project:
+Point the tool at the first shard of the BF16 GGUF once:
 
 ```sh
-export BINARY_RECONS_MODEL_PATH=/models/model.gguf
+export BINARY_RECONS_MODEL_PATH=/models/Qwen3.8-27B-BF16-00001-of-00002.gguf
 binary-recons --project-root /path/to/target --address 0x401000
 ```
 
-`--model-preset auto` identifies Qwen and Gemma from the alias or filename.
-Explicit presets are useful when the filename is ambiguous:
+`--model-preset auto` recognizes Qwen from the alias or filename. Use an explicit
+preset if the filename is ambiguous:
 
 ```sh
 binary-recons --project-root /path/to/target --address 0x401000 \
-  --model-path /models/gemma-4.gguf --model-preset gemma
+  --model-preset qwen
 ```
-
-The Gemma preset uses Gemma's recommended sampling defaults. The Qwen preset
-adds llama.cpp's Qwen MTP speculative-decoding flags. CLI sampling options
-override either preset.
 
 Managed mode starts one `llama-server`, monitors it, records its PID and logs,
-and stops only that owned process group on exit. To reuse an already-running
-server without taking ownership of it:
+and stops only that owned process group on exit. The Qwen preset enables the
+llama.cpp MTP speculative-decoding flags and the tested non-thinking sampling
+defaults. Contract and exact-edit requests lower the temperature to `0.2` for
+stability unless a sampling override is supplied.
+
+To reuse an already-running server without taking ownership of it:
 
 ```sh
 binary-recons --project-root /path/to/target --address 0x401000 \
-  --server-mode external
+  --server-mode external --model qwen3.8-27b
 ```
 
-Use `--dry-run-prompt` to inspect all collected evidence without loading a
-model. Runs are recorded under the configured `output_dir`, grouped by model,
-address, and timestamp. Model timeouts and exhausted structured-output retries
-are recorded there and reported as one concise CLI error.
+Useful controls are:
 
-Each model response is validated before it can replace source. The target
-definition, managed prototype, and all supporting insertions are applied as one
-transaction, compiled, compared, and then rolled back. Only the best complete
-workspace is retained. A pre-build validation rejection or build failure
-triggers a narrow repair request that receives only the failing change set,
-diagnostics, project rules, and allowed support-file context. For an unnamed
-target, this includes recovering from a collision with an existing function
-name without Python inventing a replacement: the model proposes a short,
-diverse name list, the driver rejects reserved entries, and the selected model
-name is applied only to the candidate contract. Repairs may repair an earlier
-repair; the default limit is two calls, configurable with `--repair-attempts`
-(`--compile-repair-attempts` remains an alias, and `0` disables repairs).
+- `--target-score 80` — stop once binary-comp reaches the requested similarity.
+- `--max-edits 4` — cap post-seed Qwen edit requests; `0` measures only the seed.
+- `--max-tokens 320` — cap output globally; each stage applies a smaller cap.
+- `--request-timeout 60` — bound each model request.
+- `--dry-run-prompt` — collect evidence and write the next prompt without loading
+  a model.
+- `--reopen-contract` — discard a weak existing name/prototype and infer a new
+  contract without exposing the old one.
+- `--resume-candidate PATH` — use a logged candidate or
+  `selected-change-set.json` as the seed without repeating contract inference.
 
-Every normal candidate and repair is logged as both its function source and its
-full structured change set. `selected-change-set.json` records the exact
-retained model output, score, and files changed. Exceptions, interruptions, and
-exhausted failed repairs restore the last successfully compiled workspace.
+`--max-iterations` remains an alias for `--max-edits` for existing scripts.
 
-This restricted path is intentionally the default for smaller local models: it
-has no recursive exploration or expanding tool context. A future external
-agent integration can use the same evidence/submit/diagnostics boundary for
-exceptional functions without widening ordinary runs.
+## Transactions and logs
+
+Every candidate is rendered against the original workspace snapshot, applied,
+compiled, compared, and rolled back before its result is considered. Only the
+best compiling workspace is retained. Exceptions, interrupts, timeouts, invalid
+patches, stale exact text, brace-balance changes, operational-name
+reintroductions, and non-improving trials cannot overwrite it.
+
+Runs are stored under the configured `output_dir`, grouped by model, address,
+and timestamp. A run records:
+
+- the contract prompt and structured response;
+- every deterministic seed normalization;
+- every compile/similarity prompt, raw structured patch, sanitized patch,
+  compiler/comparison output, and acceptance decision;
+- llama.cpp ownership, command, PID, health, and shutdown state; and
+- `selected-change-set.json`, containing the exact retained candidate, score,
+  and changed files.
+
+If no candidate compiles, the original workspace is restored and the command
+returns a failure status. A below-target candidate that does compile is retained
+so a fast first pass remains useful.

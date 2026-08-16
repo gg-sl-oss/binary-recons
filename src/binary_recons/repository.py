@@ -428,12 +428,12 @@ class ProjectRepository:
             re.M | re.S,
         )
         if match is not None:
-            return text[match.start() :].strip()[:6000]
+            return text[match.start() :].strip()[:24000]
         if symbol is not None:
             match = re.search(r"^.*\b%s\s*\(" % re.escape(symbol), text, re.M)
             if match is not None:
-                return text[match.start() :].strip()[:6000]
-        return text.strip()[:6000]
+                return text[match.start() :].strip()[:24000]
+        return text.strip()[:24000]
 
     def _string_evidence(self, assembly: str, decompilation: str) -> str:
         configured = self.config.strings_file
@@ -858,11 +858,55 @@ class ProjectRepository:
         return "\n".join(selected)[-6000:]
 
     @staticmethod
+    def compact_similarity_feedback(output: str) -> str:
+        """Keep mismatched instruction rows while normalizing relocated addresses."""
+
+        lines = output.splitlines()
+        mismatches: list[str] = []
+        header = next(
+            (line for line in lines if "Comparison for function" in line),
+            "",
+        )
+
+        def instruction_shape(value: str) -> str:
+            value = value.split(":", 1)[-1]
+            value = re.sub(r"0x[0-9A-Fa-f]{5,}", "0xADDR", value)
+            return re.sub(r"\s+", " ", value).strip().lower()
+
+        for line in lines:
+            if " | " not in line:
+                continue
+            left, right = line.split(" | ", 1)
+            if instruction_shape(left) != instruction_shape(right):
+                mismatches.append(line)
+
+        similarity = next(
+            (line for line in reversed(lines) if "Similarity:" in line),
+            "",
+        )
+        selected = [header] if header else []
+        selected.extend(mismatches[:24])
+        if len(mismatches) > 24:
+            selected.extend(["... later mismatch rows omitted ...", *mismatches[-8:]])
+        if similarity:
+            selected.append(similarity)
+        if not selected:
+            return ProjectRepository.compact_feedback(output, None)
+        return "\n".join(selected)[-9000:]
+
+    @staticmethod
     def has_compiler_errors(output: str) -> bool:
         return COMPILER_ERROR_RE.search(output) is not None
 
     @staticmethod
-    def is_repairable_build_failure(output: str) -> bool:
-        """Allow bounded repair for diagnostics, but not a timed-out build."""
+    def compiler_error_count(output: str) -> int:
+        return len(COMPILER_ERROR_RE.findall(output))
 
-        return bool(output.strip()) and "BUILD/COMPARE TIMED OUT" not in output
+    @staticmethod
+    def is_repairable_build_failure(output: str) -> bool:
+        """Allow model repair only for actual compiler/linker diagnostics."""
+
+        return (
+            "BUILD/COMPARE TIMED OUT" not in output
+            and ProjectRepository.has_compiler_errors(output)
+        )

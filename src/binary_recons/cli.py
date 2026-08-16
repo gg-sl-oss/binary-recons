@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
-from pydantic import ValidationError
-
 from .model_client import ModelRequestError
 from .models import (
+    Candidate,
     DEFAULT_MODEL_PATH,
     LlamaServerConfig,
     ModelPreset,
@@ -27,7 +27,7 @@ def _integer(value: str) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Run a bounded Instructor/llama.cpp/binary-comp reconstruction search"
+            "Integrate a Ghidra C seed with bounded Instructor/Qwen exact edits"
         )
     )
     target = parser.add_argument_group("target")
@@ -64,33 +64,40 @@ def build_parser() -> argparse.ArgumentParser:
             "model to infer a replacement"
         ),
     )
+    target.add_argument(
+        "--resume-candidate",
+        type=Path,
+        help=(
+            "seed from a logged candidate JSON or selected-change-set.json "
+            "without requesting a new contract"
+        ),
+    )
 
     search = parser.add_argument_group("search")
-    search.add_argument("--max-iterations", type=int, default=3)
-    search.add_argument("--candidates-per-iteration", type=int, default=3)
+    search.add_argument(
+        "--max-edits",
+        "--max-iterations",
+        dest="max_edits",
+        type=int,
+        default=4,
+        help="maximum one-edit Qwen rounds after the mechanical seed (default: 4)",
+    )
     search.add_argument("--target-score", type=float, default=80.0)
-    search.add_argument("--max-tokens", type=int, default=1200)
+    search.add_argument(
+        "--max-tokens",
+        type=int,
+        default=320,
+        help="hard output-token cap; each staged request applies a lower cap",
+    )
     search.add_argument(
         "--reasoning-effort",
         choices=("none", "low", "medium"),
         default="none",
     )
-    search.add_argument("--history-limit", type=int, default=4)
     search.add_argument("--max-callees", type=int, default=8)
-    search.add_argument("--request-timeout", type=float, default=180.0)
+    search.add_argument("--request-timeout", type=float, default=60.0)
     search.add_argument("--build-timeout", type=float, default=120.0)
     search.add_argument("--format-retries", type=int, default=1)
-    search.add_argument(
-        "--repair-attempts",
-        "--compile-repair-attempts",
-        dest="compile_repair_attempts",
-        metavar="N",
-        type=int,
-        default=2,
-        help=(
-            "focused LLM repair calls after validation or build failures (0 disables)"
-        ),
-    )
     search.add_argument(
         "--seed",
         type=_integer,
@@ -157,19 +164,22 @@ def main(argv: list[str] | None = None) -> int:
     model_alias = args.model
     if model_alias is None:
         model_alias = model_path.stem if model_path is not None else "local-model"
+    resume_candidate = None
+    if args.resume_candidate is not None:
+        payload = json.loads(args.resume_candidate.read_text(encoding="utf-8"))
+        if isinstance(payload, dict) and "candidate" in payload:
+            payload = payload["candidate"]
+        resume_candidate = Candidate.model_validate(payload)
     search_config = SearchConfig(
         model=model_alias,
-        max_iterations=args.max_iterations,
-        candidates_per_iteration=args.candidates_per_iteration,
+        max_edits=args.max_edits,
         target_score=args.target_score,
         max_tokens=args.max_tokens,
         reasoning_effort=args.reasoning_effort,
-        history_limit=args.history_limit,
         max_callees=args.max_callees,
         request_timeout=args.request_timeout,
         build_timeout=args.build_timeout,
         format_retries=args.format_retries,
-        compile_repair_attempts=args.compile_repair_attempts,
         seed=args.seed if args.seed is not None else args.address,
         temperature=args.temperature,
         top_p=args.top_p,
@@ -199,16 +209,25 @@ def main(argv: list[str] | None = None) -> int:
         ),
         flush=True,
     )
-    result = ReconstructionSearch(repository, target, search_config, server_config).run(
-        dry_run_prompt=args.dry_run_prompt
-    )
+    result = ReconstructionSearch(
+        repository,
+        target,
+        search_config,
+        server_config,
+        initial_candidate=resume_candidate,
+    ).run(dry_run_prompt=args.dry_run_prompt)
     return 0 if result.score is not None or args.dry_run_prompt else 1
 
 
 def entrypoint() -> int:
     try:
         return main()
-    except (RuntimeError, OSError, ValidationError, ModelRequestError) as error:
+    except (
+        RuntimeError,
+        OSError,
+        ValueError,
+        ModelRequestError,
+    ) as error:
         print("binary-recons: %s" % error, file=sys.stderr)
         return 1
     except KeyboardInterrupt:

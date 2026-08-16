@@ -1,4 +1,4 @@
-"""File-backed run logging."""
+"""File-backed audit log for every deterministic and model-assisted stage."""
 
 from __future__ import annotations
 
@@ -10,8 +10,9 @@ from typing import Any
 
 from .models import (
     Candidate,
-    CandidateBatch,
+    ContractProposal,
     SearchConfig,
+    SourcePatch,
     SymbolProposalBatch,
     TargetSpec,
 )
@@ -20,7 +21,8 @@ from .utils import atomic_write, utc_now, write_json
 
 class RunLog:
     def __init__(self, output_root: Path, target: TargetSpec, config: SearchConfig):
-        stamp = time.strftime("%Y%m%d-%H%M%S")
+        subsecond = (time.time_ns() % 1_000_000_000) // 1_000
+        stamp = "%s-%06d" % (time.strftime("%Y%m%d-%H%M%S"), subsecond)
         model_name = re.sub(r"[^A-Za-z0-9._-]+", "-", config.model).strip("-.")
         model_name = model_name[:80] or "local-model"
         self.directory = output_root / model_name / ("%08X" % target.address) / stamp
@@ -29,6 +31,7 @@ class RunLog:
         self._manifest: dict[str, Any] = {
             "started_at": utc_now(),
             "status": "running",
+            "workflow": "ghidra-seed-bounded-qwen-edits-v1",
             "target": target.model_dump(mode="json"),
             "search": config.model_dump(mode="json"),
             "python_dependencies": {
@@ -57,8 +60,129 @@ class RunLog:
         except PackageNotFoundError:
             return None
 
+    @staticmethod
+    def _completion(completion: Any) -> Any:
+        return (
+            completion.model_dump(mode="json")
+            if hasattr(completion, "model_dump")
+            else completion
+        )
+
     def write_baseline(self, comparison: str) -> None:
         atomic_write(self.directory / "baseline.compare.txt", comparison)
+
+    def write_contract_prompt(self, prompt: str) -> None:
+        atomic_write(self.directory / "contract.prompt.txt", prompt)
+
+    def write_contract_generation(
+        self,
+        contract: ContractProposal,
+        completion: Any,
+    ) -> None:
+        write_json(
+            self.directory / "contract.json",
+            {
+                "contract": contract.model_dump(mode="json"),
+                "completion": self._completion(completion),
+            },
+        )
+
+    def write_symbol_prompt(self, attempt: int, prompt: str) -> None:
+        atomic_write(
+            self.directory / ("contract-name-repair-%02d.prompt.txt" % attempt),
+            prompt,
+        )
+
+    def write_symbol_generation(
+        self,
+        attempt: int,
+        proposals: SymbolProposalBatch,
+        selected: str | None,
+        completion: Any,
+    ) -> None:
+        write_json(
+            self.directory / ("contract-name-repair-%02d.json" % attempt),
+            {
+                "proposals": proposals.symbols,
+                "selected": selected,
+                "completion": self._completion(completion),
+            },
+        )
+
+    def write_seed(
+        self,
+        candidate: Candidate,
+        mechanical_changes: list[str],
+        comparison: str,
+        score: float | None,
+        origin: str,
+    ) -> None:
+        write_json(
+            self.directory / "seed.json",
+            {
+                "candidate": candidate.model_dump(mode="json"),
+                "mechanical_changes": mechanical_changes,
+                "origin": origin,
+                "score": score,
+            },
+        )
+        atomic_write(self.directory / "seed.c", candidate.source.rstrip() + "\n")
+        atomic_write(self.directory / "seed.compare.txt", comparison.rstrip() + "\n")
+
+    def write_edit_prompt(self, round_number: int, kind: str, prompt: str) -> None:
+        atomic_write(
+            self.directory / ("edit-%02d.%s.prompt.txt" % (round_number, kind)),
+            prompt,
+        )
+
+    def write_edit_generation(
+        self,
+        round_number: int,
+        kind: str,
+        patch: SourcePatch,
+        completion: Any,
+    ) -> None:
+        write_json(
+            self.directory / ("edit-%02d.%s.response.json" % (round_number, kind)),
+            {
+                "patch": patch.model_dump(mode="json"),
+                "completion": self._completion(completion),
+            },
+        )
+
+    def write_edit_result(
+        self,
+        round_number: int,
+        kind: str,
+        candidate: Candidate | None,
+        patch: SourcePatch,
+        rejected_operations: list[str],
+        comparison: str,
+        score: float | None,
+        accepted: bool,
+        metrics: dict[str, int],
+    ) -> None:
+        prefix = self.directory / ("edit-%02d.%s" % (round_number, kind))
+        write_json(
+            Path(str(prefix) + ".result.json"),
+            {
+                "accepted": accepted,
+                "candidate": (
+                    candidate.model_dump(mode="json") if candidate is not None else None
+                ),
+                "metrics": metrics,
+                "patch": patch.model_dump(mode="json"),
+                "rejected_operations": rejected_operations,
+                "score": score,
+            },
+        )
+        if candidate is not None:
+            atomic_write(
+                Path(str(prefix) + ".candidate.c"),
+                candidate.source.rstrip() + "\n",
+            )
+            write_json(Path(str(prefix) + ".candidate.json"), candidate)
+        atomic_write(Path(str(prefix) + ".compare.txt"), comparison.rstrip() + "\n")
 
     def write_selected(
         self,
@@ -73,102 +197,4 @@ class RunLog:
                 "changed_files": changed_files,
                 "score": score,
             },
-        )
-
-    def write_prompt(self, iteration: int, prompt: str) -> None:
-        atomic_write(self.directory / ("iteration-%02d.prompt.txt" % iteration), prompt)
-
-    def write_generation(
-        self,
-        iteration: int,
-        batch: CandidateBatch,
-        completion: Any,
-    ) -> None:
-        write_json(self.directory / ("iteration-%02d.batch.json" % iteration), batch)
-        if hasattr(completion, "model_dump"):
-            completion = completion.model_dump(mode="json")
-        write_json(
-            self.directory / ("iteration-%02d.completion.json" % iteration),
-            completion,
-        )
-
-    def write_candidate(
-        self,
-        iteration: int,
-        index: int,
-        candidate: Candidate,
-        comparison: str,
-    ) -> None:
-        prefix = self.directory / ("iteration-%02d-candidate-%02d" % (iteration, index))
-        write_json(prefix.with_suffix(".json"), candidate)
-        atomic_write(prefix.with_suffix(".c"), candidate.source.rstrip() + "\n")
-        atomic_write(prefix.with_suffix(".compare.txt"), comparison.rstrip() + "\n")
-
-    def write_repair_prompt(
-        self,
-        iteration: int,
-        index: int,
-        repair_attempt: int,
-        prompt: str,
-    ) -> None:
-        prefix = self._repair_prefix(iteration, index, repair_attempt)
-        atomic_write(prefix.with_suffix(".prompt.txt"), prompt)
-
-    def write_repair_generation(
-        self,
-        iteration: int,
-        index: int,
-        repair_attempt: int,
-        candidate: Candidate,
-        completion: Any,
-    ) -> None:
-        prefix = self._repair_prefix(iteration, index, repair_attempt)
-        if hasattr(completion, "model_dump"):
-            completion = completion.model_dump(mode="json")
-        write_json(prefix.with_suffix(".candidate.json"), candidate)
-        write_json(prefix.with_suffix(".completion.json"), completion)
-
-    def write_symbol_repair_generation(
-        self,
-        iteration: int,
-        index: int,
-        repair_attempt: int,
-        proposals: SymbolProposalBatch,
-        selected: str | None,
-        candidate: Candidate | None,
-        completion: Any,
-    ) -> None:
-        prefix = self._repair_prefix(iteration, index, repair_attempt)
-        if hasattr(completion, "model_dump"):
-            completion = completion.model_dump(mode="json")
-        write_json(
-            prefix.with_suffix(".symbols.json"),
-            {"proposals": proposals.symbols, "selected": selected},
-        )
-        if candidate is not None:
-            write_json(prefix.with_suffix(".candidate.json"), candidate)
-        write_json(prefix.with_suffix(".completion.json"), completion)
-
-    def write_repair_candidate(
-        self,
-        iteration: int,
-        index: int,
-        repair_attempt: int,
-        candidate: Candidate,
-        comparison: str,
-    ) -> None:
-        prefix = self._repair_prefix(iteration, index, repair_attempt)
-        write_json(prefix.with_suffix(".json"), candidate)
-        atomic_write(prefix.with_suffix(".c"), candidate.source.rstrip() + "\n")
-        atomic_write(prefix.with_suffix(".compare.txt"), comparison.rstrip() + "\n")
-
-    def _repair_prefix(
-        self,
-        iteration: int,
-        index: int,
-        repair_attempt: int,
-    ) -> Path:
-        return self.directory / (
-            "iteration-%02d-candidate-%02d-repair-%02d"
-            % (iteration, index, repair_attempt)
         )

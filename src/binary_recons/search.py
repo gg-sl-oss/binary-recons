@@ -1,30 +1,45 @@
-"""Bounded generate/compile/compare search controlled entirely by Python."""
+"""Compile-first Ghidra integration with bounded, monotonic model edits."""
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
 from .llama_server import ManagedLlamaServer
-from .model_client import CandidateGenerator
-from .models import Candidate, LlamaServerConfig, SearchConfig, TargetSpec
+from .model_client import ModelRequestError, StructuredModelClient
+from .models import (
+    Candidate,
+    ContractProposal,
+    EvidenceBundle,
+    LlamaServerConfig,
+    SearchConfig,
+    SimilarityPatch,
+    SourcePatch,
+    TargetSpec,
+)
 from .prompts import (
-    HistoryItem,
-    build_compile_repair_prompt,
-    build_prompt,
+    build_compile_patch_prompt,
+    build_contract_prompt,
+    build_similarity_patch_prompt,
     build_symbol_repair_prompt,
-    build_validation_repair_prompt,
 )
 from .repository import (
     ProjectRepository,
     candidate_fingerprint,
     current_function,
     is_generic_function_symbol,
-    normalize_candidate_marker,
     rename_candidate_symbol,
     validate_candidate,
 )
 from .runlog import RunLog
+from .seed import (
+    candidate_from_seed,
+    normalize_contract,
+    normalize_decompiler_seed,
+    normalize_resumed_candidate,
+)
+from .source_edits import apply_source_patch, patch_metrics, sanitize_source_patch
 
 
 @dataclass(frozen=True)
@@ -38,9 +53,12 @@ class SearchResult:
 
 
 @dataclass(frozen=True)
-class _AttemptResult:
+class _Evaluation:
+    candidate: Candidate
+    target: TargetSpec
+    workspace: dict[Path, str]
     score: float | None
-    feedback: str
+    output: str
 
 
 def _select_symbol_proposal(
@@ -60,6 +78,41 @@ def _select_symbol_proposal(
     return None
 
 
+def _contract_problem(
+    contract: ContractProposal,
+    reserved_symbols: set[str],
+    address: int,
+) -> str | None:
+    if contract.symbol in reserved_symbols:
+        return "The proposed symbol `%s` is already reserved." % contract.symbol
+    if is_generic_function_symbol(contract.symbol):
+        return "The proposed symbol `%s` is operational or generic." % contract.symbol
+    if "%X" % address in contract.symbol.upper():
+        return "The proposed symbol `%s` contains the target address." % contract.symbol
+    return None
+
+
+def _rename_contract(contract: ContractProposal, symbol: str) -> ContractProposal:
+    prototype, count = re.subn(
+        r"\b%s\b" % re.escape(contract.symbol),
+        symbol,
+        contract.prototype,
+    )
+    if count != 1:
+        raise RuntimeError("could not rename the inferred function contract safely")
+    return ContractProposal(symbol=symbol, prototype=prototype)
+
+
+def _quality(
+    repository: ProjectRepository,
+    score: float | None,
+    output: str,
+) -> tuple[int, float]:
+    if score is not None:
+        return 1, score
+    return 0, float(-repository.compiler_error_count(output))
+
+
 class ReconstructionSearch:
     def __init__(
         self,
@@ -67,705 +120,717 @@ class ReconstructionSearch:
         target: TargetSpec,
         search_config: SearchConfig,
         server_config: LlamaServerConfig,
+        initial_candidate: Candidate | None = None,
     ):
         self.repository = repository
         self.target = target
         self.config = search_config
         self.server_config = server_config
+        self.initial_candidate = initial_candidate
 
-    def _compile_candidate(
+    def _evaluate(
         self,
         candidate: Candidate,
-        candidate_target: TargetSpec,
+        active_target: TargetSpec,
         baseline_workspace: dict[Path, str],
-        best_workspace: dict[Path, str],
-    ) -> tuple[dict[Path, str], float | None, str]:
+        restore_workspace: dict[Path, str],
+        reserved_symbols: set[str],
+        allowed_support_paths: set[str],
+    ) -> _Evaluation:
+        validate_candidate(
+            candidate,
+            active_target,
+            reserved_symbols,
+            allowed_support_paths,
+        )
         trial_workspace = self.repository.render_candidate_workspace(
-            candidate_target,
+            active_target,
             candidate,
             baseline_workspace,
         )
         try:
             self.repository.apply_workspace(trial_workspace)
-            score, comparison = self.repository.compare(
-                candidate_target, self.config.build_timeout
+            score, output = self.repository.compare(
+                active_target,
+                self.config.build_timeout,
             )
         finally:
-            self.repository.apply_workspace(best_workspace)
-        return trial_workspace, score, comparison
+            self.repository.apply_workspace(restore_workspace)
+        return _Evaluation(candidate, active_target, trial_workspace, score, output)
+
+    def _repair_contract_name(
+        self,
+        client: StructuredModelClient,
+        run_log: RunLog,
+        evidence: EvidenceBundle,
+        contract: ContractProposal,
+        reserved_symbols: set[str],
+    ) -> ContractProposal:
+        problem = _contract_problem(contract, reserved_symbols, self.target.address)
+        for attempt in range(1, 3):
+            if problem is None:
+                return contract
+            prompt = build_symbol_repair_prompt(
+                self.target,
+                evidence,
+                contract,
+                problem,
+            )
+            run_log.write_symbol_prompt(attempt, prompt)
+            proposals, completion = client.propose_symbols(prompt, attempt)
+            selected = _select_symbol_proposal(
+                proposals.symbols,
+                reserved_symbols,
+                self.target.address,
+            )
+            run_log.write_symbol_generation(
+                attempt,
+                proposals,
+                selected,
+                completion,
+            )
+            if selected is not None:
+                contract = _rename_contract(contract, selected)
+            problem = _contract_problem(contract, reserved_symbols, self.target.address)
+        if problem is not None:
+            raise RuntimeError(
+                "Qwen could not produce a usable function name: %s" % problem
+            )
+        return contract
+
+    def _baseline_evaluation(
+        self,
+        baseline_workspace: dict[Path, str],
+        run_log: RunLog,
+    ) -> _Evaluation | None:
+        if not self.target.has_contract:
+            return None
+        source = current_function(
+            baseline_workspace[self.target.source_path.resolve()],
+            self.target.address,
+        )
+        if source is None:
+            return None
+        assert self.target.symbol is not None
+        assert self.target.prototype is not None
+        candidate = Candidate(
+            symbol=self.target.symbol,
+            prototype=self.target.prototype,
+            source=source,
+        )
+        score, output = self.repository.compare(
+            self.target,
+            self.config.build_timeout,
+        )
+        run_log.write_baseline(output)
+        return _Evaluation(
+            candidate,
+            self.target,
+            dict(baseline_workspace),
+            score,
+            output,
+        )
+
+    def _prepare_resumed_candidate(
+        self,
+    ) -> tuple[Candidate, TargetSpec, list[str]]:
+        assert self.initial_candidate is not None
+        candidate, changes = normalize_resumed_candidate(
+            self.initial_candidate,
+            self.repository,
+            self.target.address,
+        )
+        if self.target.has_contract:
+            if (
+                candidate.symbol != self.target.symbol
+                or candidate.prototype != self.target.prototype
+            ):
+                raise RuntimeError(
+                    "resumed candidate contract does not match the established target"
+                )
+            return candidate, self.target, changes
+        return candidate, self.target.with_candidate_contract(candidate), changes
+
+    def _prepare_configured_seed(
+        self,
+        evidence: EvidenceBundle,
+    ) -> tuple[Candidate, TargetSpec, list[str]]:
+        """Build a Ghidra seed when the caller supplied a fixed contract."""
+
+        assert self.target.symbol is not None
+        assert self.target.prototype is not None
+        contract = ContractProposal(
+            symbol=self.target.symbol,
+            prototype=self.target.prototype,
+        )
+        normalized, changes = normalize_decompiler_seed(
+            evidence.decompiler_hint,
+            self.repository,
+            contract,
+            excluded_address=self.target.address,
+        )
+        candidate = candidate_from_seed(
+            normalized,
+            contract,
+            self.target.address,
+        )
+        return candidate, self.target, changes
+
+    def _write_dry_run(
+        self,
+        run_log: RunLog,
+        evidence: EvidenceBundle,
+        evaluation: _Evaluation | None,
+    ) -> SearchResult:
+        if evaluation is None:
+            prompt = build_contract_prompt(self.target, evidence)
+            run_log.write_contract_prompt(prompt)
+            stage = "contract"
+            path = run_log.directory / "contract.prompt.txt"
+        elif evaluation.score is not None:
+            feedback = self.repository.compact_similarity_feedback(evaluation.output)
+            prompt = build_similarity_patch_prompt(
+                evaluation.target,
+                evidence,
+                evaluation.candidate,
+                feedback,
+            )
+            run_log.write_edit_prompt(1, "similarity", prompt)
+            stage = "similarity-edit"
+            path = run_log.directory / "edit-01.similarity.prompt.txt"
+        elif self.repository.is_repairable_build_failure(evaluation.output):
+            feedback = self.repository.compact_feedback(evaluation.output, None)
+            prompt = build_compile_patch_prompt(
+                evaluation.target,
+                evidence,
+                evaluation.candidate,
+                feedback,
+            )
+            run_log.write_edit_prompt(1, "compile", prompt)
+            stage = "compile-repair"
+            path = run_log.directory / "edit-01.compile.prompt.txt"
+        else:
+            run_log.update_manifest(
+                status="failed",
+                stage="build-or-compare",
+                error="comparison failed without compiler diagnostics",
+            )
+            print("logs: %s" % run_log.directory)
+            return SearchResult(
+                score=None,
+                target_reached=False,
+                attempts=0,
+                session_directory=run_log.directory,
+                symbol=evaluation.target.symbol,
+                prototype=evaluation.target.prototype,
+            )
+        run_log.update_manifest(status="dry-run", stage=stage)
+        print(path)
+        return SearchResult(
+            score=evaluation.score if evaluation is not None else None,
+            target_reached=False,
+            attempts=0,
+            session_directory=run_log.directory,
+            symbol=evaluation.target.symbol if evaluation is not None else None,
+            prototype=evaluation.target.prototype if evaluation is not None else None,
+        )
 
     def run(self, dry_run_prompt: bool = False) -> SearchResult:
         evidence = self.repository.collect_evidence(
-            self.target, self.config.max_callees
+            self.target,
+            self.config.max_callees,
         )
         baseline_workspace = self.repository.snapshot_workspace(self.target)
         output_root = self.repository.config.resolve(
-            self.repository.root, self.repository.config.output_dir
+            self.repository.root,
+            self.repository.config.output_dir,
         )
         run_log = RunLog(output_root, self.target, self.config)
-        best_workspace = dict(baseline_workspace)
-        existing_source = current_function(
-            baseline_workspace[self.target.source_path.resolve()], self.target.address
-        )
-        best_candidate = (
-            Candidate(
-                symbol=self.target.symbol,
-                prototype=self.target.prototype,
-                source=existing_source,
-            )
-            if existing_source is not None and self.target.has_contract
-            else None
-        )
-        best_target = self.target
-        best_score = -1.0
-        best_feedback = ""
-        history: list[HistoryItem] = []
-        seen: set[str] = set()
         reserved_symbols = set(self.repository.reserved_symbols(self.target))
         allowed_support_paths = self.repository.allowed_support_paths()
+
+        best_workspace = dict(baseline_workspace)
+        try:
+            best_evaluation = self._baseline_evaluation(baseline_workspace, run_log)
+        except BaseException as error:
+            run_log.update_manifest(
+                status="failed",
+                stage="baseline",
+                error={"type": type(error).__name__, "message": str(error)},
+            )
+            raise
+        working = best_evaluation
         attempts = 0
+        stop_reason = "edit-budget-exhausted"
+        seen: set[str] = set()
+        if working is not None:
+            seen.add(candidate_fingerprint(working.candidate))
+            if working.score is not None:
+                print("baseline similarity: %.2f%%" % working.score, flush=True)
+                if working.score >= self.config.target_score:
+                    result = SearchResult(
+                        score=working.score,
+                        target_reached=True,
+                        attempts=0,
+                        session_directory=run_log.directory,
+                        symbol=working.target.symbol,
+                        prototype=working.target.prototype,
+                    )
+                    run_log.update_manifest(
+                        status="complete",
+                        stop_reason="target-already-reached",
+                        result={
+                            **result.__dict__,
+                            "session_directory": str(result.session_directory),
+                        },
+                    )
+                    print("target already meets %.2f%%" % self.config.target_score)
+                    print("logs: %s" % run_log.directory)
+                    return result
 
         try:
-            if best_candidate is not None:
-                baseline_score, baseline_output = self.repository.compare(
-                    self.target, self.config.build_timeout
+            if self.initial_candidate is not None:
+                candidate, active_target, changes = self._prepare_resumed_candidate()
+                problem = _contract_problem(
+                    ContractProposal(
+                        symbol=candidate.symbol,
+                        prototype=candidate.prototype,
+                    ),
+                    reserved_symbols,
+                    self.target.address,
                 )
-                run_log.write_baseline(baseline_output)
-                fingerprint = candidate_fingerprint(best_candidate)
-                seen.add(fingerprint)
-                history.append(
-                    HistoryItem(
-                        fingerprint=fingerprint,
-                        score=baseline_score,
-                        candidate=best_candidate.model_dump_json(indent=2),
+                if problem is None:
+                    working = self._evaluate(
+                        candidate,
+                        active_target,
+                        baseline_workspace,
+                        best_workspace,
+                        reserved_symbols,
+                        allowed_support_paths,
                     )
-                )
-                best_feedback = self.repository.compact_feedback(
-                    baseline_output, baseline_score
-                )
-                if baseline_score is not None:
-                    best_score = baseline_score
-                    print("baseline similarity: %.2f%%" % baseline_score, flush=True)
-                    if baseline_score >= self.config.target_score:
-                        result = SearchResult(
-                            score=baseline_score,
-                            target_reached=True,
-                            attempts=0,
-                            session_directory=run_log.directory,
-                            symbol=best_target.symbol,
-                            prototype=best_target.prototype,
-                        )
-                        run_log.update_manifest(
-                            status="complete",
-                            completed_without_model=True,
-                            result={
-                                "score": result.score,
-                                "target_reached": True,
-                                "attempts": 0,
-                                "symbol": best_target.symbol,
-                                "prototype": best_target.prototype,
-                            },
-                        )
-                        print("target already meets %.2f%%" % self.config.target_score)
-                        print("logs: %s" % run_log.directory)
-                        return result
+                    attempts += 1
+                    run_log.write_seed(
+                        candidate,
+                        changes,
+                        working.output,
+                        working.score,
+                        "resumed-candidate",
+                    )
+                    seen.add(candidate_fingerprint(candidate))
+                    if working.score is not None and (
+                        best_evaluation is None
+                        or best_evaluation.score is None
+                        or working.score > best_evaluation.score
+                    ):
+                        best_evaluation = working
+                        best_workspace = working.workspace
+                        self.repository.apply_workspace(best_workspace)
 
-            initial_prompt = build_prompt(
-                self.target,
-                evidence,
-                self.config,
-                best_candidate,
-                best_feedback,
-                history,
-            )
+            if (
+                working is None
+                and self.initial_candidate is None
+                and self.target.has_contract
+            ):
+                candidate, active_target, changes = self._prepare_configured_seed(
+                    evidence
+                )
+                working = self._evaluate(
+                    candidate,
+                    active_target,
+                    baseline_workspace,
+                    best_workspace,
+                    reserved_symbols,
+                    allowed_support_paths,
+                )
+                attempts += 1
+                run_log.write_seed(
+                    candidate,
+                    changes,
+                    working.output,
+                    working.score,
+                    "configured-contract",
+                )
+                seen.add(candidate_fingerprint(candidate))
+                if working.score is not None and (
+                    best_evaluation is None
+                    or best_evaluation.score is None
+                    or working.score > best_evaluation.score
+                ):
+                    best_evaluation = working
+                    best_workspace = working.workspace
+                    self.repository.apply_workspace(best_workspace)
+
             if dry_run_prompt:
-                run_log.write_prompt(1, initial_prompt)
-                run_log.update_manifest(status="dry-run", stage="prompt")
-                print(run_log.directory / "iteration-01.prompt.txt")
-                return SearchResult(
-                    score=None if best_score < 0 else best_score,
-                    target_reached=False,
-                    attempts=0,
-                    session_directory=run_log.directory,
-                    symbol=best_target.symbol,
-                    prototype=best_target.prototype,
+                return self._write_dry_run(run_log, evidence, working)
+
+            needs_contract = working is None
+            if self.initial_candidate is not None:
+                prepared, _, _ = self._prepare_resumed_candidate()
+                problem = _contract_problem(
+                    ContractProposal(
+                        symbol=prepared.symbol,
+                        prototype=prepared.prototype,
+                    ),
+                    reserved_symbols,
+                    self.target.address,
                 )
+                needs_contract = problem is not None
 
-            server = ManagedLlamaServer(
-                self.server_config, self.config, run_log.directory
-            )
-            with server:
-                generator = CandidateGenerator(server, self.config)
-                try:
-                    for iteration in range(1, self.config.max_iterations + 1):
-                        prompt = build_prompt(
-                            best_target,
-                            evidence,
-                            self.config,
-                            best_candidate,
-                            best_feedback,
-                            history,
-                        )
-                        run_log.write_prompt(iteration, prompt)
-                        print(
-                            "iteration %d/%d: requesting %s"
-                            % (
-                                iteration,
-                                self.config.max_iterations,
-                                self.config.model,
-                            ),
-                            flush=True,
-                        )
-                        batch, completion = generator.generate(prompt, iteration)
-                        run_log.write_generation(iteration, batch, completion)
+            if (
+                working is not None
+                and working.score is not None
+                and working.score >= self.config.target_score
+            ):
+                stop_reason = "target-reached-by-seed"
+            elif self.config.max_edits == 0 and not needs_contract:
+                stop_reason = "edits-disabled"
+            else:
+                server = ManagedLlamaServer(
+                    self.server_config,
+                    self.config,
+                    run_log.directory,
+                )
+                with server:
+                    run_log.update_manifest(
+                        model_preset=self.server_config.resolved_preset().value
+                    )
+                    client = StructuredModelClient(server, self.config)
+                    try:
+                        if needs_contract:
+                            if self.initial_candidate is not None:
+                                candidate, _, changes = (
+                                    self._prepare_resumed_candidate()
+                                )
+                                contract = ContractProposal(
+                                    symbol=candidate.symbol,
+                                    prototype=candidate.prototype,
+                                )
+                                origin = "resumed-candidate"
+                            else:
+                                prompt = build_contract_prompt(self.target, evidence)
+                                run_log.write_contract_prompt(prompt)
+                                print("requesting Qwen contract", flush=True)
+                                contract, completion = client.infer_contract(prompt)
+                                contract = normalize_contract(contract, self.repository)
+                                run_log.write_contract_generation(contract, completion)
+                                candidate = None
+                                changes = []
+                                origin = "ghidra-decompilation"
 
-                        batch_results: list[_AttemptResult] = []
-                        target_reached = False
-                        batch_contract = best_target
-                        candidates = batch.candidates[
-                            : self.config.candidates_per_iteration
-                        ]
-                        for index, proposed in enumerate(candidates, 1):
-                            candidate = normalize_candidate_marker(
-                                proposed, self.target.address
+                            contract = self._repair_contract_name(
+                                client,
+                                run_log,
+                                evidence,
+                                contract,
+                                reserved_symbols,
                             )
-                            contract_locked = batch_contract.has_contract
-                            candidate_target = (
-                                batch_contract
-                                if contract_locked
-                                else self.target.with_candidate_contract(candidate)
-                            )
-                            fingerprint = candidate_fingerprint(candidate)
-                            if fingerprint in seen:
-                                feedback = (
-                                    "CANDIDATE SKIPPED: fingerprint already tried"
-                                )
-                                run_log.write_candidate(
-                                    iteration, index, candidate, feedback
-                                )
-                                batch_results.append(_AttemptResult(None, feedback))
-                                print(
-                                    "iteration %d candidate %d: duplicate"
-                                    % (iteration, index),
-                                    flush=True,
-                                )
-                                continue
-                            seen.add(fingerprint)
-                            attempts += 1
-
-                            repair_attempts_used = 0
-                            candidate_valid = False
-                            while True:
-                                try:
-                                    validate_candidate(
+                            if candidate is not None:
+                                if candidate.symbol != contract.symbol:
+                                    candidate = rename_candidate_symbol(
                                         candidate,
-                                        candidate_target,
-                                        reserved_symbols,
-                                        allowed_support_paths,
+                                        contract.symbol,
                                     )
-                                except ValueError as error:
-                                    feedback = (
-                                        "CANDIDATE REJECTED BEFORE BUILD: %s" % error
+                                if candidate.prototype != contract.prototype:
+                                    candidate = candidate.model_copy(
+                                        update={"prototype": contract.prototype}
                                     )
-                                    if repair_attempts_used == 0:
-                                        run_log.write_candidate(
-                                            iteration, index, candidate, feedback
-                                        )
-                                    else:
-                                        run_log.write_repair_candidate(
-                                            iteration,
-                                            index,
-                                            repair_attempts_used,
-                                            candidate,
-                                            feedback,
-                                        )
-                                    history.append(
-                                        HistoryItem(
-                                            fingerprint=fingerprint,
-                                            score=None,
-                                            candidate=candidate.model_dump_json(
-                                                indent=2
-                                            ),
-                                        )
+                                    candidate = candidate_from_seed(
+                                        candidate.source,
+                                        contract,
+                                        self.target.address,
+                                        candidate.supporting_insertions,
                                     )
-                                    if (
-                                        repair_attempts_used
-                                        >= self.config.compile_repair_attempts
-                                    ):
-                                        break
+                            else:
+                                normalized, changes = normalize_decompiler_seed(
+                                    evidence.decompiler_hint,
+                                    self.repository,
+                                    contract,
+                                    excluded_address=self.target.address,
+                                )
+                                candidate = candidate_from_seed(
+                                    normalized,
+                                    contract,
+                                    self.target.address,
+                                )
+                            active_target = self.target.with_candidate_contract(
+                                candidate
+                            )
+                            working = self._evaluate(
+                                candidate,
+                                active_target,
+                                baseline_workspace,
+                                best_workspace,
+                                reserved_symbols,
+                                allowed_support_paths,
+                            )
+                            attempts += 1
+                            run_log.write_seed(
+                                candidate,
+                                changes,
+                                working.output,
+                                working.score,
+                                origin,
+                            )
+                            seen.add(candidate_fingerprint(candidate))
+                            if working.score is not None and (
+                                best_evaluation is None
+                                or best_evaluation.score is None
+                                or working.score > best_evaluation.score
+                            ):
+                                best_evaluation = working
+                                best_workspace = working.workspace
+                                self.repository.apply_workspace(best_workspace)
+                            print(
+                                "mechanical seed: %s"
+                                % (
+                                    "build failed"
+                                    if working.score is None
+                                    else "%.2f%%" % working.score
+                                ),
+                                flush=True,
+                            )
 
-                                    repair_attempt = repair_attempts_used + 1
-                                    symbol_repair = not contract_locked and (
-                                        candidate.symbol in reserved_symbols
-                                        or is_generic_function_symbol(candidate.symbol)
-                                    )
-                                    if symbol_repair:
-                                        repair_prompt = build_symbol_repair_prompt(
-                                            batch_contract,
-                                            evidence,
-                                            candidate,
-                                            feedback,
-                                        )
-                                        repair_kind = "symbol"
-                                    else:
-                                        repair_prompt = build_validation_repair_prompt(
-                                            batch_contract,
-                                            evidence,
-                                            self.config,
-                                            candidate,
-                                            feedback,
-                                            repair_attempt,
-                                        )
-                                        repair_kind = "validation"
-                                    run_log.write_repair_prompt(
-                                        iteration,
-                                        index,
-                                        repair_attempt,
-                                        repair_prompt,
-                                    )
-                                    print(
-                                        "iteration %d candidate %d: requesting "
-                                        "%s repair %d/%d"
-                                        % (
-                                            iteration,
-                                            index,
-                                            repair_kind,
-                                            repair_attempt,
-                                            self.config.compile_repair_attempts,
-                                        ),
-                                        flush=True,
-                                    )
-                                    if symbol_repair:
-                                        proposals, repair_completion = (
-                                            generator.propose_symbols(
-                                                repair_prompt,
-                                                iteration,
-                                                index,
-                                                repair_attempt,
-                                            )
-                                        )
-                                        selected_symbol = _select_symbol_proposal(
-                                            proposals.symbols,
-                                            reserved_symbols,
-                                            self.target.address,
-                                        )
-                                        repaired_candidate = (
-                                            rename_candidate_symbol(
-                                                candidate, selected_symbol
-                                            )
-                                            if selected_symbol is not None
-                                            else None
-                                        )
-                                        run_log.write_symbol_repair_generation(
-                                            iteration,
-                                            index,
-                                            repair_attempt,
-                                            proposals,
-                                            selected_symbol,
-                                            repaired_candidate,
-                                            repair_completion,
-                                        )
-                                        repair_attempts_used = repair_attempt
-                                        if repaired_candidate is None:
-                                            feedback = (
-                                                "SYMBOL REPAIR REJECTED: every "
-                                                "proposal is reserved or invalid"
-                                            )
-                                            print(
-                                                "iteration %d candidate %d repair "
-                                                "%d: no usable symbol"
-                                                % (
-                                                    iteration,
-                                                    index,
-                                                    repair_attempt,
-                                                ),
-                                                flush=True,
-                                            )
-                                            continue
-                                    else:
-                                        repaired, repair_completion = generator.repair(
-                                            repair_prompt,
-                                            iteration,
-                                            index,
-                                            repair_attempt,
-                                        )
-                                        run_log.write_repair_generation(
-                                            iteration,
-                                            index,
-                                            repair_attempt,
-                                            repaired,
-                                            repair_completion,
-                                        )
-                                        repaired_candidate = normalize_candidate_marker(
-                                            repaired, self.target.address
-                                        )
-                                    repaired_fingerprint = candidate_fingerprint(
-                                        repaired_candidate
-                                    )
-                                    repair_attempts_used = repair_attempt
-                                    if repaired_fingerprint in seen:
-                                        duplicate_feedback = (
-                                            "REPAIR SKIPPED: fingerprint already tried"
-                                        )
-                                        run_log.write_repair_candidate(
-                                            iteration,
-                                            index,
-                                            repair_attempt,
-                                            repaired_candidate,
-                                            duplicate_feedback,
-                                        )
-                                        print(
-                                            "iteration %d candidate %d repair %d: "
-                                            "duplicate"
-                                            % (iteration, index, repair_attempt),
-                                            flush=True,
-                                        )
-                                        continue
-                                    seen.add(repaired_fingerprint)
-                                    attempts += 1
-                                    candidate = repaired_candidate
-                                    fingerprint = repaired_fingerprint
-                                    if not contract_locked:
-                                        candidate_target = (
-                                            self.target.with_candidate_contract(
-                                                candidate
-                                            )
-                                        )
-                                    continue
-                                candidate_valid = True
+                        if working is None:
+                            raise RuntimeError("no reconstruction seed is available")
+
+                        previous_rejection = ""
+                        for round_number in range(1, self.config.max_edits + 1):
+                            if (
+                                working.score is not None
+                                and working.score >= self.config.target_score
+                            ):
+                                stop_reason = "target-reached"
                                 break
-
-                            if not candidate_valid:
-                                batch_results.append(_AttemptResult(None, feedback))
+                            if working.score is None:
+                                if not self.repository.is_repairable_build_failure(
+                                    working.output
+                                ):
+                                    stop_reason = "non-compiler-build-failure"
+                                    break
+                                kind = "compile"
+                                feedback = self.repository.compact_feedback(
+                                    working.output,
+                                    None,
+                                )
+                                prompt = build_compile_patch_prompt(
+                                    working.target,
+                                    evidence,
+                                    working.candidate,
+                                    feedback,
+                                    previous_rejection,
+                                )
+                                run_log.write_edit_prompt(round_number, kind, prompt)
                                 print(
-                                    "iteration %d candidate %d: rejected"
-                                    % (iteration, index),
+                                    "edit %d/%d: requesting compile repair"
+                                    % (round_number, self.config.max_edits),
                                     flush=True,
                                 )
-                                continue
-
-                            trial_workspace, score, comparison = (
-                                self._compile_candidate(
-                                    candidate,
-                                    candidate_target,
-                                    baseline_workspace,
-                                    best_workspace,
-                                )
-                            )
-                            feedback = self.repository.compact_feedback(
-                                comparison, score
-                            )
-                            if repair_attempts_used == 0:
-                                run_log.write_candidate(
-                                    iteration, index, candidate, comparison
+                                raw_patch, completion = client.repair_compile(
+                                    prompt,
+                                    round_number,
                                 )
                             else:
-                                run_log.write_repair_candidate(
-                                    iteration,
-                                    index,
-                                    repair_attempts_used,
-                                    candidate,
-                                    comparison,
+                                kind = "similarity"
+                                feedback = self.repository.compact_similarity_feedback(
+                                    working.output
                                 )
-                            history.append(
-                                HistoryItem(
-                                    fingerprint=fingerprint,
-                                    score=score,
-                                    candidate=candidate.model_dump_json(indent=2),
+                                prompt = build_similarity_patch_prompt(
+                                    working.target,
+                                    evidence,
+                                    working.candidate,
+                                    feedback,
+                                    previous_rejection,
                                 )
-                            )
-
-                            if (
-                                score is None
-                                and self.config.compile_repair_attempts
-                                > repair_attempts_used
-                                and self.repository.is_repairable_build_failure(
-                                    comparison
-                                )
-                            ):
-                                for repair_attempt in range(
-                                    repair_attempts_used + 1,
-                                    self.config.compile_repair_attempts + 1,
-                                ):
-                                    repair_prompt = build_compile_repair_prompt(
-                                        candidate_target,
-                                        evidence,
-                                        self.config,
-                                        candidate,
-                                        feedback,
-                                        repair_attempt,
-                                    )
-                                    run_log.write_repair_prompt(
-                                        iteration,
-                                        index,
-                                        repair_attempt,
-                                        repair_prompt,
-                                    )
-                                    print(
-                                        "iteration %d candidate %d: requesting "
-                                        "compile repair %d/%d"
-                                        % (
-                                            iteration,
-                                            index,
-                                            repair_attempt,
-                                            self.config.compile_repair_attempts,
-                                        ),
-                                        flush=True,
-                                    )
-                                    repaired, repair_completion = generator.repair(
-                                        repair_prompt,
-                                        iteration,
-                                        index,
-                                        repair_attempt,
-                                    )
-                                    run_log.write_repair_generation(
-                                        iteration,
-                                        index,
-                                        repair_attempt,
-                                        repaired,
-                                        repair_completion,
-                                    )
-
-                                    repaired_candidate = normalize_candidate_marker(
-                                        repaired, self.target.address
-                                    )
-                                    repaired_fingerprint = candidate_fingerprint(
-                                        repaired_candidate
-                                    )
-                                    if repaired_fingerprint in seen:
-                                        duplicate_feedback = (
-                                            "REPAIR SKIPPED: fingerprint already tried"
-                                        )
-                                        run_log.write_repair_candidate(
-                                            iteration,
-                                            index,
-                                            repair_attempt,
-                                            repaired_candidate,
-                                            duplicate_feedback,
-                                        )
-                                        print(
-                                            "iteration %d candidate %d repair %d: "
-                                            "duplicate"
-                                            % (iteration, index, repair_attempt),
-                                            flush=True,
-                                        )
-                                        continue
-
-                                    seen.add(repaired_fingerprint)
-                                    attempts += 1
-                                    candidate = repaired_candidate
-                                    fingerprint = repaired_fingerprint
-                                    try:
-                                        validate_candidate(
-                                            candidate,
-                                            candidate_target,
-                                            reserved_symbols,
-                                            allowed_support_paths,
-                                        )
-                                    except ValueError as error:
-                                        score = None
-                                        feedback = (
-                                            "REPAIR REJECTED BEFORE BUILD: %s" % error
-                                        )
-                                        run_log.write_repair_candidate(
-                                            iteration,
-                                            index,
-                                            repair_attempt,
-                                            candidate,
-                                            feedback,
-                                        )
-                                        history.append(
-                                            HistoryItem(
-                                                fingerprint=fingerprint,
-                                                score=None,
-                                                candidate=candidate.model_dump_json(
-                                                    indent=2
-                                                ),
-                                            )
-                                        )
-                                        print(
-                                            "iteration %d candidate %d repair %d: "
-                                            "rejected"
-                                            % (iteration, index, repair_attempt),
-                                            flush=True,
-                                        )
-                                        continue
-
-                                    trial_workspace, score, comparison = (
-                                        self._compile_candidate(
-                                            candidate,
-                                            candidate_target,
-                                            baseline_workspace,
-                                            best_workspace,
-                                        )
-                                    )
-                                    feedback = self.repository.compact_feedback(
-                                        comparison, score
-                                    )
-                                    run_log.write_repair_candidate(
-                                        iteration,
-                                        index,
-                                        repair_attempt,
-                                        candidate,
-                                        comparison,
-                                    )
-                                    history.append(
-                                        HistoryItem(
-                                            fingerprint=fingerprint,
-                                            score=score,
-                                            candidate=candidate.model_dump_json(
-                                                indent=2
-                                            ),
-                                        )
-                                    )
-                                    if score is not None:
-                                        print(
-                                            "iteration %d candidate %d repair %d: "
-                                            "similarity %.2f%%"
-                                            % (
-                                                iteration,
-                                                index,
-                                                repair_attempt,
-                                                score,
-                                            ),
-                                            flush=True,
-                                        )
-                                        break
-                                    if not self.repository.is_repairable_build_failure(
-                                        comparison
-                                    ):
-                                        print(
-                                            "iteration %d candidate %d repair %d: "
-                                            "build/compare failed"
-                                            % (iteration, index, repair_attempt),
-                                            flush=True,
-                                        )
-                                        break
-
-                            batch_results.append(_AttemptResult(score, feedback))
-
-                            if score is None:
+                                run_log.write_edit_prompt(round_number, kind, prompt)
                                 print(
-                                    "iteration %d candidate %d: build/compare failed"
-                                    % (iteration, index),
+                                    "edit %d/%d: requesting similarity edit"
+                                    % (round_number, self.config.max_edits),
                                     flush=True,
                                 )
-                                continue
-                            print(
-                                "iteration %d candidate %d: similarity %.2f%%"
-                                % (iteration, index, score),
-                                flush=True,
-                            )
-                            if score > best_score:
-                                best_score = score
-                                best_workspace = trial_workspace
-                                best_candidate = candidate
-                                best_target = candidate_target
-                                best_feedback = feedback
-                                self.repository.apply_workspace(best_workspace)
-                            if best_score >= self.config.target_score:
-                                target_reached = True
-                                break
-
-                        if batch_results:
-                            scored = [
-                                result
-                                for result in batch_results
-                                if result.score is not None
-                            ]
-                            selected = (
-                                max(scored, key=lambda result: result.score)
-                                if scored
-                                else batch_results[-1]
-                            )
-                            summary = "\n".join(
-                                "candidate %d: %s"
-                                % (
-                                    index,
-                                    "failed/rejected"
-                                    if result.score is None
-                                    else "%.2f%%" % result.score,
+                                proposed, completion = client.improve_similarity(
+                                    prompt,
+                                    round_number,
                                 )
-                                for index, result in enumerate(batch_results, 1)
-                            )
-                            best_feedback = (
-                                selected.feedback + "\nBATCH SUMMARY\n" + summary
-                            )
+                                assert isinstance(proposed, SimilarityPatch)
+                                raw_patch = SourcePatch(edits=[proposed.edit])
 
-                        if target_reached:
-                            assert best_candidate is not None
-                            changed_files = self.repository.changed_workspace_files(
-                                baseline_workspace, best_workspace
+                            run_log.write_edit_generation(
+                                round_number,
+                                kind,
+                                raw_patch,
+                                completion,
                             )
-                            run_log.write_selected(
-                                best_candidate, best_score, changed_files
+                            patch, rejected = sanitize_source_patch(
+                                working.candidate.source,
+                                raw_patch,
+                                working.candidate.symbol,
                             )
-                            result = SearchResult(
-                                score=best_score,
-                                target_reached=True,
-                                attempts=attempts,
-                                session_directory=run_log.directory,
-                                symbol=best_target.symbol,
-                                prototype=best_target.prototype,
+                            if not patch.edits and not patch.identifier_replacements:
+                                previous_rejection = "; ".join(rejected) or (
+                                    "the model returned an empty patch"
+                                )
+                                run_log.write_edit_result(
+                                    round_number,
+                                    kind,
+                                    None,
+                                    patch,
+                                    rejected,
+                                    "PATCH NOT APPLIED: " + previous_rejection,
+                                    None,
+                                    False,
+                                    {},
+                                )
+                                print("edit %d: rejected before build" % round_number)
+                                continue
+
+                            try:
+                                trial_candidate = apply_source_patch(
+                                    working.candidate,
+                                    patch,
+                                    self.target.address,
+                                )
+                                fingerprint = candidate_fingerprint(trial_candidate)
+                                if fingerprint in seen:
+                                    raise ValueError(
+                                        "patch reproduces an earlier candidate"
+                                    )
+                                seen.add(fingerprint)
+                                trial = self._evaluate(
+                                    trial_candidate,
+                                    working.target,
+                                    baseline_workspace,
+                                    best_workspace,
+                                    reserved_symbols,
+                                    allowed_support_paths,
+                                )
+                                attempts += 1
+                            except ValueError as error:
+                                previous_rejection = "candidate rejected: %s" % error
+                                run_log.write_edit_result(
+                                    round_number,
+                                    kind,
+                                    None,
+                                    patch,
+                                    rejected,
+                                    previous_rejection,
+                                    None,
+                                    False,
+                                    {},
+                                )
+                                print("edit %d: rejected before build" % round_number)
+                                continue
+
+                            accepted = (
+                                trial.score is not None
+                                or self.repository.has_compiler_errors(trial.output)
+                            ) and _quality(
+                                self.repository,
+                                trial.score,
+                                trial.output,
+                            ) > _quality(
+                                self.repository,
+                                working.score,
+                                working.output,
                             )
-                            run_log.update_manifest(
-                                status="complete",
-                                result={
-                                    "score": best_score,
-                                    "target_reached": True,
-                                    "attempts": attempts,
-                                    "symbol": best_target.symbol,
-                                    "prototype": best_target.prototype,
-                                    "changed_files": changed_files,
-                                },
+                            run_log.write_edit_result(
+                                round_number,
+                                kind,
+                                trial.candidate,
+                                patch,
+                                rejected,
+                                trial.output,
+                                trial.score,
+                                accepted,
+                                patch_metrics(trial.candidate, patch),
                             )
-                            print("target reached: %.2f%%" % best_score, flush=True)
+                            if not accepted:
+                                previous_rejection = (
+                                    "the trial did not reduce compiler errors or "
+                                    "increase binary-comp similarity"
+                                )
+                                print(
+                                    "edit %d: measured result rejected" % round_number
+                                )
+                                continue
+
+                            working = trial
+                            previous_rejection = ""
+                            if trial.score is not None and (
+                                best_evaluation is None
+                                or best_evaluation.score is None
+                                or trial.score > best_evaluation.score
+                            ):
+                                best_evaluation = trial
+                                best_workspace = trial.workspace
+                                self.repository.apply_workspace(best_workspace)
                             print(
-                                "selected contract: %s — %s"
-                                % (best_target.symbol, best_target.prototype),
+                                "edit %d: accepted, %s"
+                                % (
+                                    round_number,
+                                    "build still failing"
+                                    if trial.score is None
+                                    else "similarity %.2f%%" % trial.score,
+                                ),
                                 flush=True,
                             )
-                            print("logs: %s" % run_log.directory)
-                            return result
-                finally:
-                    generator.close()
+                        else:
+                            stop_reason = "edit-budget-exhausted"
+                    except ModelRequestError as error:
+                        if best_evaluation is None or best_evaluation.score is None:
+                            raise
+                        stop_reason = "model-request-failed-after-compiled-seed"
+                        run_log.update_manifest(model_error=str(error))
+                        print(
+                            "model request failed; preserving the best compiled seed",
+                            flush=True,
+                        )
+                    finally:
+                        client.close()
 
-            score = None if best_score < 0 else best_score
-            result = SearchResult(
-                score=score,
-                target_reached=False,
-                attempts=attempts,
-                session_directory=run_log.directory,
-                symbol=best_target.symbol,
-                prototype=best_target.prototype,
+            score = best_evaluation.score if best_evaluation is not None else None
+            target_reached = score is not None and score >= self.config.target_score
+            if target_reached and stop_reason == "edit-budget-exhausted":
+                stop_reason = "target-reached"
+            selected_target = (
+                best_evaluation.target
+                if best_evaluation is not None
+                else (working.target if working is not None else self.target)
             )
             changed_files: list[str] = []
-            if score is not None and best_candidate is not None:
+            if score is not None and best_evaluation is not None:
                 changed_files = self.repository.changed_workspace_files(
-                    baseline_workspace, best_workspace
+                    baseline_workspace,
+                    best_workspace,
                 )
-                run_log.write_selected(best_candidate, score, changed_files)
+                run_log.write_selected(
+                    best_evaluation.candidate,
+                    score,
+                    changed_files,
+                )
+            result = SearchResult(
+                score=score,
+                target_reached=target_reached,
+                attempts=attempts,
+                session_directory=run_log.directory,
+                symbol=selected_target.symbol,
+                prototype=selected_target.prototype,
+            )
             run_log.update_manifest(
                 status="complete" if score is not None else "failed",
+                stop_reason=stop_reason,
                 result={
-                    "score": score,
-                    "target_reached": False,
-                    "attempts": attempts,
-                    "symbol": best_target.symbol,
-                    "prototype": best_target.prototype,
+                    **result.__dict__,
+                    "session_directory": str(result.session_directory),
                     "changed_files": changed_files,
                 },
             )
             if score is None:
-                print(
-                    "no candidate compiled; original source restored",
-                    flush=True,
-                )
+                print("no candidate compiled; original source restored", flush=True)
             else:
-                print("best retained similarity: %.2f%%" % score)
+                print("best retained similarity: %.2f%%" % score, flush=True)
                 print(
                     "selected contract: %s — %s"
-                    % (best_target.symbol, best_target.prototype),
+                    % (selected_target.symbol, selected_target.prototype),
                     flush=True,
                 )
             print("logs: %s" % run_log.directory)

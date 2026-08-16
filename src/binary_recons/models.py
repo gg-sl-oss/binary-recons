@@ -22,15 +22,85 @@ def discover_default_model_path() -> Path | None:
 
 DEFAULT_MODEL_PATH = discover_default_model_path()
 
-MAX_CANDIDATE_CHARS = 12000
+MAX_CANDIDATE_CHARS = 32000
 MAX_SUPPORTING_INSERTION_CHARS = 8000
 MAX_SUPPORTING_TOTAL_CHARS = 24000
+MAX_EXACT_EDIT_CHARS = 600
 
 
 def _clean_multiline_text(value: str) -> str:
     """Strip model-added line-end whitespace before content reaches the workspace."""
 
     return "\n".join(line.rstrip() for line in value.splitlines()).strip()
+
+
+def _split_prototype_parameters(prototype: str, symbol: str) -> list[str]:
+    match = re.search(r"\b%s\s*\(" % re.escape(symbol), prototype)
+    if match is None:
+        return []
+    start = prototype.find("(", match.start())
+    depth = 0
+    beginning = start + 1
+    parameters: list[str] = []
+    for index in range(beginning, len(prototype)):
+        character = prototype[index]
+        if character in "([":
+            depth += 1
+        elif character == "]":
+            depth = max(0, depth - 1)
+        elif character == ")":
+            if depth == 0:
+                parameters.append(prototype[beginning:index].strip())
+                return parameters
+            depth -= 1
+        elif character == "," and depth == 0:
+            parameters.append(prototype[beginning:index].strip())
+            beginning = index + 1
+    return []
+
+
+def _parameter_has_name(parameter: str) -> bool:
+    if parameter in ("", "void", "..."):
+        return True
+    if re.search(r"\(\s*\*\s*[A-Za-z_]\w*\s*\)", parameter):
+        return True
+    identifiers = re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", parameter)
+    keywords = {
+        "char",
+        "const",
+        "double",
+        "enum",
+        "float",
+        "int",
+        "long",
+        "register",
+        "short",
+        "signed",
+        "struct",
+        "union",
+        "unsigned",
+        "void",
+        "volatile",
+    }
+    non_keywords = [
+        identifier for identifier in identifiers if identifier not in keywords
+    ]
+    if not non_keywords:
+        return False
+    if len(non_keywords) >= 2:
+        return True
+    builtin_types = {
+        "char",
+        "double",
+        "float",
+        "int",
+        "long",
+        "short",
+        "signed",
+        "unsigned",
+        "void",
+    }
+    return any(identifier in builtin_types for identifier in identifiers[:-1])
 
 
 class ServerMode(str, Enum):
@@ -76,7 +146,7 @@ class SupportingInsertion(BaseModel):
 
 
 class Candidate(BaseModel):
-    """One complete, bounded source change set proposed by the model."""
+    """One complete, bounded source transaction evaluated by the driver."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -120,17 +190,101 @@ class Candidate(BaseModel):
 
     @model_validator(mode="after")
     def contract_agrees(self) -> "Candidate":
-        if self.symbol not in self.prototype:
+        if re.search(r"\b%s\s*\(" % re.escape(self.symbol), self.prototype) is None:
             raise ValueError("prototype does not contain the proposed symbol")
         return self
 
 
-class CandidateBatch(BaseModel):
-    """A bounded set of source hypotheses generated in one request."""
+class ContractProposal(BaseModel):
+    """The small name-and-interface decision made before body integration."""
 
     model_config = ConfigDict(extra="forbid")
 
-    candidates: list[Candidate] = Field(min_length=1, max_length=8)
+    symbol: str = Field(
+        min_length=3,
+        max_length=100,
+        pattern=r"^[A-Za-z_][A-Za-z0-9_]*$",
+        description="Meaningful source-level function name without an address.",
+    )
+    prototype: str = Field(
+        min_length=6,
+        max_length=1000,
+        description=(
+            "Complete function signature, including parameter names, without a "
+            "trailing semicolon."
+        ),
+    )
+
+    @field_validator("prototype")
+    @classmethod
+    def strip_prototype(cls, value: str) -> str:
+        return value.strip().rstrip(";").strip()
+
+    @model_validator(mode="after")
+    def contract_agrees(self) -> "ContractProposal":
+        if re.search(r"\b%s\s*\(" % re.escape(self.symbol), self.prototype) is None:
+            raise ValueError("prototype does not contain the proposed symbol")
+        unnamed = [
+            parameter
+            for parameter in _split_prototype_parameters(
+                self.prototype,
+                self.symbol,
+            )
+            if not _parameter_has_name(parameter)
+        ]
+        if unnamed:
+            raise ValueError(
+                "every non-void contract parameter must have a name: %s"
+                % ", ".join(unnamed)
+            )
+        return self
+
+
+class ExactEdit(BaseModel):
+    """One bounded textual substitution against the current accepted source."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    old: str = Field(min_length=1, max_length=MAX_EXACT_EDIT_CHARS)
+    new: str = Field(max_length=MAX_EXACT_EDIT_CHARS)
+    mode: Literal["once", "all"] = "once"
+
+
+class IdentifierReplacement(BaseModel):
+    """A whole-token rename used mainly for unresolved decompiler identifiers."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    old: str = Field(
+        min_length=1,
+        max_length=100,
+        pattern=r"^[A-Za-z_][A-Za-z0-9_]*$",
+    )
+    new: str = Field(
+        min_length=1,
+        max_length=100,
+        pattern=r"^[A-Za-z_][A-Za-z0-9_]*$",
+    )
+
+
+class SourcePatch(BaseModel):
+    """A compile-repair response small enough to validate mechanically."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    identifier_replacements: list[IdentifierReplacement] = Field(
+        default_factory=list,
+        max_length=8,
+    )
+    edits: list[ExactEdit] = Field(default_factory=list, max_length=1)
+
+
+class SimilarityPatch(BaseModel):
+    """A single source-form experiment for an already-compiling function."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    edit: ExactEdit
 
 
 class SymbolProposalBatch(BaseModel):
@@ -139,8 +293,8 @@ class SymbolProposalBatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     symbols: list[str] = Field(
-        min_length=3,
-        max_length=8,
+        min_length=6,
+        max_length=6,
         description=(
             "Distinct, meaningful C identifiers ordered from strongest to weakest."
         ),
@@ -205,17 +359,14 @@ class SearchConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     model: str = "local-model"
-    max_iterations: int = Field(default=3, ge=1, le=20)
-    candidates_per_iteration: int = Field(default=3, ge=1, le=8)
+    max_edits: int = Field(default=4, ge=0, le=20)
     target_score: float = Field(default=80.0, ge=0.0, le=100.0)
-    max_tokens: int = Field(default=1200, ge=128)
+    max_tokens: int = Field(default=320, ge=64, le=2000)
     reasoning_effort: Literal["none", "low", "medium"] = "none"
-    history_limit: int = Field(default=4, ge=0, le=20)
     max_callees: int = Field(default=8, ge=0, le=32)
-    request_timeout: float = Field(default=180.0, gt=0)
+    request_timeout: float = Field(default=60.0, gt=0)
     build_timeout: float = Field(default=120.0, gt=0)
     format_retries: int = Field(default=1, ge=0, le=3)
-    compile_repair_attempts: int = Field(default=2, ge=0, le=3)
     seed: int
     temperature: float | None = Field(default=None, ge=0.0, le=2.0)
     top_p: float | None = Field(default=None, gt=0.0, le=1.0)
@@ -271,7 +422,7 @@ class LlamaServerConfig(BaseModel):
     preset: ModelPreset = ModelPreset.AUTO
     host: str = "127.0.0.1"
     port: int = Field(default=8080, ge=1, le=65535)
-    context_size: int = Field(default=16384, ge=2048)
+    context_size: int = Field(default=32768, ge=2048)
     startup_timeout: float = Field(default=240.0, gt=0)
     shutdown_timeout: float = Field(default=15.0, gt=0)
     health_interval: float = Field(default=0.5, gt=0)

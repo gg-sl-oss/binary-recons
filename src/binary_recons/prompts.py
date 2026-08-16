@@ -1,309 +1,213 @@
-"""Prompt construction for deterministic candidate batches."""
+"""Small, stage-specific prompts for the compile-first reconstruction loop."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
-from .models import Candidate, EvidenceBundle, SearchConfig, TargetSpec
+from .models import Candidate, ContractProposal, EvidenceBundle, TargetSpec
 
 
 SYSTEM_PROMPT = """\
-You are searching for the original source form of one compiled function.
-Original assembly is authoritative and decompiled source is only a semantic
-hint. Infer changes yourself from mechanically supplied compiler comparisons.
-Populate only the requested structured response; do not return analysis,
-Markdown, patches, or unrelated edits.
+You assist a deterministic binary source-reconstruction driver. Return only the
+requested structured data. Never return analysis, Markdown, a whole replacement
+function, shell commands, tool calls, or unrelated edits. Original assembly and
+compiler feedback are authoritative; decompiled C is only a semantic seed.
 """
 
 
-@dataclass(frozen=True)
-class HistoryItem:
-    fingerprint: str
-    score: float | None
-    candidate: str
+def _excerpt(text: str, limit: int = 8000) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n... prompt context mechanically truncated ..."
 
 
-def _format_history(history: list[HistoryItem], limit: int) -> str:
-    if not history or limit == 0:
-        return "No prior candidates."
-    blocks: list[str] = []
-    for item in history[-limit:]:
-        score = "build failed" if item.score is None else "%.2f%%" % item.score
-        blocks.append(
-            "fingerprint %s, score %s\n%s"
-            % (item.fingerprint[:12], score, item.candidate)
-        )
-    return "\n\n".join(blocks)
-
-
-def build_prompt(
-    target: TargetSpec,
-    evidence: EvidenceBundle,
-    config: SearchConfig,
-    best_candidate: Candidate | None,
-    feedback: str,
-    history: list[HistoryItem],
-) -> str:
-    current = (
-        best_candidate.model_dump_json(indent=2)
-        if best_candidate is not None
-        else "<not implemented>"
-    )
-    last_result = feedback if feedback else "No candidate has been compiled yet."
-    if target.has_contract:
-        contract = f"""\
-- Existing symbol: {target.symbol}
-- Existing signature: {target.prototype}
-- Preserve that symbol, signature, and calling convention in every candidate."""
-    else:
-        contract = """\
-- No source-level name or interface is supplied for this unimplemented target.
-- Infer a concise, meaningful function name and complete prototype from the raw
-  assembly, decompiler hint, callers/callees, strings, and declarations.
-- Do not use a Ghidra label, address, generic placeholder, or mechanism-only
-  name. Each candidate's symbol and prototype fields must exactly describe its
-  source definition."""
-    roles = [
-        "- Candidate 1 must isolate a declaration/order/lifetime hypothesis. "
-        "When values occupy different registers or stack slots, vary only meaningful "
-        "parameter copies or locals supported by the semantics.",
-        "- Candidate 2 must isolate a control-flow or expression-order hypothesis. "
-        "Use pre/post side effects when the original copies a value before changing "
-        "it but the rebuild folds the operation into an indexed access.",
-        "- Candidate 3 must combine the strongest evidence-supported hypotheses for "
-        "the currently unmatched regions instead of making cosmetic rewrites.",
-    ]
-    role_text = "\n".join(roles[: config.candidates_per_iteration])
-    if config.candidates_per_iteration > len(roles):
-        role_text += (
-            "\n- Additional candidates must explore other independent, legitimate "
-            "C source-form axes visible in the compiler comparison."
-        )
+def build_contract_prompt(target: TargetSpec, evidence: EvidenceBundle) -> str:
+    """Ask Qwen for the only non-mechanical bootstrap decision."""
 
     return f"""\
-Produce exactly {config.candidates_per_iteration} materially different complete
-source definitions in the structured candidates field.
+TASK
+Infer only a meaningful source-level function name and complete prototype for
+the target below. Return CONTRACT DATA ONLY. Do not reconstruct or edit the
+body. No target name or interface has been supplied by the driver.
 
-TARGET CONTRACT
-- Marker: /* Function start: 0x{target.address:X} */
-{contract}
-- Define only the proposed target; include no declarations or surrounding file
-  text.
+CONTRACT REQUIREMENTS
+- The decompiler's FUN/sub/operational label is forbidden as a source name.
+- Use a concise purpose-based VerbObject name, without an address and without a
+  vague Helper/Handler/Function/Procedure label.
+- Include parameter names for every non-void parameter so the driver can align
+  the decompiler body mechanically.
+- Preserve parameter order, return type, pointer depth, language, and calling
+  convention supported by the evidence. Do not invent a class or wrapper.
+- Use types accepted by the configured historical compiler.
 
-TARGET PROJECT
+TARGET
+- Address (evidence key only): 0x{target.address:08X}
 - Language: {evidence.language}
 - Compiler/toolchain: {evidence.compiler}
-- Original assembly below is the only authority. Decompiled C is a hint.
-- Return structured symbol, prototype, and source fields for every candidate.
-- Define only the target function, with no includes, declarations, helpers,
-  surrounding file text, Markdown, placeholders, or unrelated edits.
-- Use only identifiers supported by the target or supplied project/declaration
-  evidence.
-- Return any target-required new types, globals, or matching global definitions
-  in supporting_insertions. Each insertion path must exactly match an allowed
-  support file below. These are append-only blocks: never repeat existing file
-  contents, edit existing declarations, or place the target prototype there.
-- A candidate must be a complete change set. If its function uses a new type or
-  global, include every declaration and definition needed to compile it. Use an
-  empty supporting_insertions list when no support is needed.
 
-TARGET-PROJECT RULES
-{evidence.project_guidance}
-
-GENERIC SOURCE-FORM SEARCH LEVERS
-- Infer types, signedness, declaration order, value lifetimes, expression
-  grouping, casts, and whether a parameter or meaningful local carries state.
-- Try source-level loop/branch equivalents, fall-through direction, early vs
-  common returns, and pre/post increment forms when instruction order asks.
-- Treat register choice, stack cleanup, operand width, and jump direction as
-  evidence. Comparisons show rebuilt instructions LEFT and original RIGHT.
-- Prefer exact identifiers from declaration evidence. An instruction displacement
-  may be a global base plus a member offset; do not assume it names a standalone
-  object.
-- Do not repeat a prior fingerprint and do not explain an inference.
-
-BATCH EXPERIMENT DESIGN
-{role_text}
-
-ORIGINAL TARGET ASSEMBLY
-{evidence.original_assembly}
-
-DECOMPILER HINT
-{evidence.decompiler_hint}
+GHIDRA DECOMPILATION (BEHAVIOR AND INTERFACE HINT)
+{_excerpt(evidence.decompiler_hint)}
 
 MECHANICALLY DISCOVERED REFERENCED STRINGS
 {evidence.string_evidence}
 
-RESERVED EXISTING SOURCE SYMBOLS
-{evidence.reserved_symbols}
-
-MECHANICALLY DISCOVERED DIRECT-CALLEE EVIDENCE
+DIRECT-CALLEE EVIDENCE
 {evidence.callee_evidence}
 
-MECHANICALLY DISCOVERED REFERENCED DECLARATIONS
+RELEVANT EXISTING DECLARATIONS
 {evidence.declaration_evidence}
 
-ALLOWED SUPPORT FILES AND CURRENT CONTENT
-{evidence.supporting_file_evidence}
-
-CURRENT BEST CANDIDATE
-{current}
-
-LAST COMPILER / BINARY-COMP RESULT
-{last_result}
-
-RECENT CANDIDATES ALREADY TRIED
-{_format_history(history, config.history_limit)}
-"""
-
-
-def build_compile_repair_prompt(
-    target: TargetSpec,
-    evidence: EvidenceBundle,
-    config: SearchConfig,
-    candidate: Candidate,
-    compiler_feedback: str,
-    repair_attempt: int,
-) -> str:
-    return f"""\
-Repair the failing change set below. Produce exactly one complete corrected
-structured change set.
-
-REPAIR PASS
-- Attempt {repair_attempt} of {config.compile_repair_attempts}.
-- This is a narrow compilation repair, not a new reconstruction attempt.
-- Preserve the candidate's behavior, control-flow shape, meaningful locals,
-  signature, marker, function name, and valid supporting insertions unless a
-  build diagnostic requires a source-level correction.
-- Fix every compiler diagnostic shown. Do not explain the fix.
-
-TARGET CONTRACT
-- Marker: /* Function start: 0x{target.address:X} */
-- Symbol: {target.symbol}
-- Signature: {target.prototype}
-- Restore and preserve this active name and interface if the failing candidate
-  changed either one.
-- Return symbol, prototype, and source fields that agree exactly.
-- Define only the target; include no declarations or surrounding file text.
-- Return a complete repaired supporting_insertions list. It replaces, rather
-  than supplements, the failing list.
-
-COMPILATION CONSTRAINTS
-- Language: {evidence.language}
-- Compiler/toolchain: {evidence.compiler}
-- Use exact identifiers and types from the supplied declaration evidence.
-- Add a type or global through an allowed support file only when target evidence
-  or a build diagnostic requires it. Do not invent unsupported helpers,
-  wrappers, fields, macros, or includes.
-- No placeholders, omitted bodies, Markdown, or unrelated edits.
-
-TARGET-PROJECT RULES
-{evidence.project_guidance}
-
-BUILD / VALIDATION DIAGNOSTICS
-{compiler_feedback}
-
-MECHANICALLY DISCOVERED REFERENCED DECLARATIONS
-{evidence.declaration_evidence}
-
-ALLOWED SUPPORT FILES AND CURRENT CONTENT
-{evidence.supporting_file_evidence}
-
-FAILING COMPLETE CHANGE SET
-{candidate.model_dump_json(indent=2)}
-"""
-
-
-def build_validation_repair_prompt(
-    target: TargetSpec,
-    evidence: EvidenceBundle,
-    config: SearchConfig,
-    candidate: Candidate,
-    validation_feedback: str,
-    repair_attempt: int,
-) -> str:
-    if target.has_contract:
-        contract = f"""\
-- Active symbol: {target.symbol}
-- Active signature: {target.prototype}
-- The target contract is established. Preserve it exactly."""
-    else:
-        contract = """\
-- This target had no established source-level contract.
-- You may replace the proposed symbol and prototype when the validation failure
-  requires it. Keep symbol, prototype, and source definition mutually exact.
-- A replacement name must remain concise, meaningful, and grounded in the
-  target behavior; never use an address or generic operational label."""
-
-    return f"""\
-Repair the rejected change set below. Produce exactly one complete corrected
-structured change set.
-
-REPAIR PASS
-- Attempt {repair_attempt} of {config.compile_repair_attempts}.
-- This is a narrow pre-build validation repair, not a new reconstruction pass.
-- Preserve the implementation's behavior and source shape except where the
-  validation diagnostic requires a correction.
-- Fix every validation diagnostic shown. Do not explain the fix.
-
-TARGET CONTRACT
-- Marker: /* Function start: 0x{target.address:X} */
-{contract}
-- Return a complete supporting_insertions list replacing the failing list.
-
-TARGET-PROJECT RULES
-{evidence.project_guidance}
-
-VALIDATION DIAGNOSTICS
-{validation_feedback}
-
-RESERVED EXISTING SOURCE SYMBOLS
+RESERVED EXISTING FUNCTION NAMES
 {evidence.reserved_symbols}
 
-DECOMPILER HINT
-{evidence.decompiler_hint}
+PROJECT AND COMPILER RULES
+{evidence.project_guidance}
 
-MECHANICALLY DISCOVERED REFERENCED DECLARATIONS
-{evidence.declaration_evidence}
-
-ALLOWED SUPPORT FILES AND CURRENT CONTENT
-{evidence.supporting_file_evidence}
-
-REJECTED COMPLETE CHANGE SET
-{candidate.model_dump_json(indent=2)}
+Return only the structured contract.
 """
 
 
 def build_symbol_repair_prompt(
     target: TargetSpec,
     evidence: EvidenceBundle,
-    candidate: Candidate,
-    validation_feedback: str,
+    contract: ContractProposal,
+    reason: str,
 ) -> str:
+    """Repair only a colliding or operational contract name."""
+
     return f"""\
-Propose exactly six fresh, meaningful C function identifiers for the rejected
-candidate below. This is a naming task only.
+NAMING VALIDATION FAILURE
+{reason}
 
-NAMING REQUIREMENTS
-- Infer the function's purpose from the assembly, decompiler hint, and candidate.
-- Return six distinct VerbObject-style identifiers, strongest first.
-- Diversify both the leading verb and the object nouns across the six choices.
-- Do not return `{candidate.symbol}`.
-- Do not use an address, FUN/sub-style label, or vague Helper/Function name.
-- Do not alter or restate the interface or implementation.
+TASK
+Return exactly six fresh, distinct, meaningful C function identifiers, strongest
+first. This is a naming task only. Keep the interface concept locked, do not
+reconstruct the body, and do not restate or alter the prototype.
 
-TARGET
-- Address: 0x{target.address:08X}
+LOCKED INTERFACE
+{contract.prototype}
 
-VALIDATION DIAGNOSTIC
-{validation_feedback}
+REQUIREMENTS
+- Infer purpose from behavior, strings, and calls.
+- Diversify the leading verbs and object nouns across the choices.
+- Do not return `{contract.symbol}`, an address, a FUN/sub label, a reserved
+  name, or a vague Helper/Handler/Function/Procedure name.
 
-ORIGINAL ASSEMBLY
-{evidence.original_assembly}
+TARGET ADDRESS (EVIDENCE KEY ONLY)
+0x{target.address:08X}
 
-DECOMPILER HINT
-{evidence.decompiler_hint}
+GHIDRA DECOMPILATION
+{_excerpt(evidence.decompiler_hint)}
 
-REJECTED CANDIDATE
+REFERENCED STRINGS
+{evidence.string_evidence}
+
+RESERVED NAMES
+{evidence.reserved_symbols}
+
+Return only the structured name list.
+"""
+
+
+def build_compile_patch_prompt(
+    target: TargetSpec,
+    evidence: EvidenceBundle,
+    candidate: Candidate,
+    compiler_feedback: str,
+    previous_rejection: str = "",
+) -> str:
+    """Put the failing compiler output first so a weak model sees the root cause."""
+
+    rejection = previous_rejection or "No earlier patch was rejected."
+    return f"""\
+COMPILER FEEDBACK FOR THE CURRENT DRAFT
+{compiler_feedback.strip()}
+
+TASK
+Fix only the first compiler root cause with the smallest possible source patch.
+This is a COMPILE-ONLY pass: do not inspect or tune assembly, rename the target,
+change its prototype, regenerate the function, or edit another file. Return
+SOURCE PATCH DATA ONLY.
+
+PATCH CONTRACT
+- The driver accepts at most one exact edit plus up to eight whole-token
+  identifier replacements.
+- Exact `old` text must occur verbatim. Use mode `once` unless every occurrence
+  is independently wrong.
+- Use identifier replacements only for simple existing-token renames.
+- Pointer arithmetic and imperfect types may remain when they compile.
+- Prefer supplied declarations. If an unresolved DAT/global has no declaration,
+  replace that identifier with a short typed absolute-address lvalue expression.
+- Do not add behavior, a helper, a declaration, an include, a macro, Markdown,
+  or an operational FUN_/DAT_ identifier.
+
+LOCKED FUNCTION CONTRACT
+{candidate.prototype}
+
+CURRENT SOURCE
 {candidate.source}
+
+GHIDRA DECOMPILATION (BEHAVIOR HINT)
+{_excerpt(evidence.decompiler_hint)}
+
+RELEVANT EXISTING DECLARATIONS
+{evidence.declaration_evidence}
+
+DIRECT-CALLEE EVIDENCE
+{evidence.callee_evidence}
+
+PROJECT AND COMPILER RULES
+{evidence.project_guidance}
+
+PREVIOUS PATCH REJECTION
+{rejection}
+
+Target address 0x{target.address:08X} is for evidence selection only. Return only
+the structured source patch.
+"""
+
+
+def build_similarity_patch_prompt(
+    target: TargetSpec,
+    evidence: EvidenceBundle,
+    candidate: Candidate,
+    comparison_feedback: str,
+    previous_rejection: str = "",
+) -> str:
+    """Ask for one source-form experiment against a compact assembly diff."""
+
+    rejection = previous_rejection or "No earlier patch was rejected."
+    return f"""\
+LATEST BINARY-COMP FEEDBACK (AUTHORITATIVE)
+{comparison_feedback.strip()}
+
+TASK
+The function compiles. Improve only the earliest important instruction-shape,
+control-flow, operand-width, register-lifetime, or stack-offset mismatch with ONE
+small exact source edit. Return PATCH DATA ONLY. Never regenerate the function,
+rename it, change its prototype, add a helper/dummy variable, or edit another
+file. Ignore relocated code and data addresses.
+
+PATCH CONTRACT
+- The exact `old` text must occur verbatim in the current source.
+- Preserve brace balance, the address marker, and unrelated statements.
+- Use mode `once` unless all occurrences are independently evidenced as wrong.
+- The driver will compile the trial transactionally and reject it unless its
+  measured similarity strictly increases.
+
+LOCKED FUNCTION CONTRACT
+{candidate.prototype}
+
+CURRENT SOURCE
+{candidate.source}
+
+COMPILER/TOOLCHAIN
+{evidence.compiler}
+
+PROJECT AND COMPILER RULES
+{evidence.project_guidance}
+
+PREVIOUS PATCH REJECTION
+{rejection}
+
+Target address 0x{target.address:08X} is for evidence selection only. Return only
+the structured single edit.
 """
