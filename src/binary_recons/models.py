@@ -363,7 +363,7 @@ class SearchConfig(BaseModel):
     target_score: float = Field(default=80.0, ge=0.0, le=100.0)
     max_tokens: int = Field(default=320, ge=64, le=2000)
     reasoning_effort: Literal["none", "low", "medium"] = "none"
-    max_callees: int = Field(default=8, ge=0, le=32)
+    max_callees: int = Field(default=2, ge=0, le=32)
     request_timeout: float = Field(default=60.0, gt=0)
     build_timeout: float = Field(default=120.0, gt=0)
     format_retries: int = Field(default=1, ge=0, le=3)

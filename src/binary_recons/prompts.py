@@ -47,19 +47,19 @@ GHIDRA DECOMPILATION (BEHAVIOR AND INTERFACE HINT)
 {_excerpt(evidence.decompiler_hint)}
 
 MECHANICALLY DISCOVERED REFERENCED STRINGS
-{evidence.string_evidence}
+{_excerpt(evidence.string_evidence, 1500)}
 
 DIRECT-CALLEE EVIDENCE
-{evidence.callee_evidence}
+{_excerpt(evidence.callee_evidence, 3000)}
 
 RELEVANT EXISTING DECLARATIONS
-{evidence.declaration_evidence}
+{_excerpt(evidence.declaration_evidence, 4000)}
 
 RESERVED EXISTING FUNCTION NAMES
-{evidence.reserved_symbols}
+{_excerpt(evidence.reserved_symbols, 2500)}
 
 PROJECT AND COMPILER RULES
-{evidence.project_guidance}
+{_excerpt(evidence.project_guidance, 3500)}
 
 Return only the structured contract.
 """
@@ -151,13 +151,13 @@ GHIDRA DECOMPILATION (BEHAVIOR HINT)
 {_excerpt(evidence.decompiler_hint)}
 
 RELEVANT EXISTING DECLARATIONS
-{evidence.declaration_evidence}
+{_excerpt(evidence.declaration_evidence, 5000)}
 
 DIRECT-CALLEE EVIDENCE
-{evidence.callee_evidence}
+{_excerpt(evidence.callee_evidence, 3500)}
 
 PROJECT AND COMPILER RULES
-{evidence.project_guidance}
+{_excerpt(evidence.project_guidance, 3500)}
 
 PREVIOUS PATCH REJECTION
 {rejection}
@@ -205,7 +205,7 @@ COMPILER/TOOLCHAIN
 {evidence.compiler}
 
 PROJECT AND COMPILER RULES
-{evidence.project_guidance}
+{_excerpt(evidence.project_guidance, 3500)}
 
 PREVIOUS PATCH REJECTION
 {rejection}

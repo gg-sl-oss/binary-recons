@@ -131,6 +131,8 @@ Useful controls are:
 
 - `--target-score 80` — stop once binary-comp reaches the requested similarity.
 - `--max-edits 4` — cap post-seed Qwen edit requests; `0` measures only the seed.
+- `--max-callees 2` — collect only the first two direct callee exports by
+  default; raise this selectively when their internals are important.
 - `--max-tokens 320` — cap output globally; each stage applies a smaller cap.
 - `--request-timeout 60` — bound each model request.
 - `--dry-run-prompt` — collect evidence and write the next prompt without loading

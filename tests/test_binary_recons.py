@@ -261,14 +261,15 @@ class RepositoryTests(unittest.TestCase):
             self.assertNotIn("HiddenTargetStub", prompt)
 
     def test_cli_has_no_alternate_draft_source_option(self) -> None:
+        parser = build_parser()
         options = {
-            option
-            for action in build_parser()._actions
-            for option in action.option_strings
+            option for action in parser._actions for option in action.option_strings
         }
         self.assertNotIn("--draft-source", options)
         self.assertIn("--max-edits", options)
         self.assertIn("--max-iterations", options)
+        args = parser.parse_args(["--address", "0x401000"])
+        self.assertEqual(args.max_callees, 2)
 
     def test_existing_definition_keeps_its_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

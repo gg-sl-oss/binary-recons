@@ -94,7 +94,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("none", "low", "medium"),
         default="none",
     )
-    search.add_argument("--max-callees", type=int, default=8)
+    search.add_argument(
+        "--max-callees",
+        type=int,
+        default=2,
+        help="direct callee exports to collect (default: 2; raise only when needed)",
+    )
     search.add_argument("--request-timeout", type=float, default=60.0)
     search.add_argument("--build-timeout", type=float, default=120.0)
     search.add_argument("--format-retries", type=int, default=1)
