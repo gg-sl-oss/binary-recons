@@ -199,6 +199,38 @@ def declaration_address_symbols(
     }
 
 
+def _declaration_lines_by_symbol(repository: ProjectRepository) -> dict[str, str]:
+    lines: dict[str, str] = {}
+    for path in repository.config.declarations(repository.root):
+        for line in read_text(path).splitlines():
+            for symbol in re.findall(
+                r"\b[A-Za-z_][A-Za-z0-9_]*_[0-9A-Fa-f]{6,8}\b",
+                line,
+            ):
+                lines.setdefault(symbol, line)
+    return lines
+
+
+def _has_numeric_use(source: str, token: str) -> bool:
+    operand = r"\b%s\b" % re.escape(token)
+    operator = r"(?:<<|>>|[+\-*/%&|^])"
+    return (
+        re.search(operand + r"\s*" + operator, source) is not None
+        or re.search(operator + r"\s*" + operand, source) is not None
+    )
+
+
+def _is_pointer_like_declaration(line: str, symbol: str) -> bool:
+    before_symbol = line.split(symbol, 1)[0]
+    if "*" in before_symbol:
+        return True
+    types = re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", before_symbol)
+    return any(
+        re.fullmatch(r"(?:H|LP|P)[A-Z][A-Z0-9_]*", type_name) is not None
+        for type_name in types
+    )
+
+
 def _string_address_literals(repository: ProjectRepository) -> dict[int, str]:
     """Return exact C string literals from the configured address map."""
 
@@ -290,6 +322,7 @@ def normalize_decompiler_seed(
             )
 
     address_symbols = declaration_address_symbols(repository, excluded_address)
+    declaration_lines = _declaration_lines_by_symbol(repository)
     operational = list(
         dict.fromkeys(re.findall(r"\b(?:DAT|FUN)_[0-9A-Fa-f]{8}\b", source))
     )
@@ -297,6 +330,18 @@ def normalize_decompiler_seed(
         address = int(token.rsplit("_", 1)[1], 16)
         replacement = address_symbols.get(address)
         if replacement is None or replacement == token:
+            continue
+        if (
+            token.startswith("DAT_")
+            and _has_numeric_use(source, token)
+            and _is_pointer_like_declaration(
+                declaration_lines.get(replacement, ""), replacement
+            )
+        ):
+            changes.append(
+                "%s skipped incompatible pointer-like declaration %s"
+                % (token, replacement)
+            )
             continue
         address_count = 0
         if token.startswith("DAT_"):

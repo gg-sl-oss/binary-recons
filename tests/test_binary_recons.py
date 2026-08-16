@@ -143,6 +143,7 @@ def make_fixture_project(root: Path, decompiled_body: str = "return 7;") -> None
         "#define FIXTURE_GLOBALS_H\n\n"
         "extern int g_fixture_value_00402010[4];\n"
         "extern FixtureVector g_fixture_vector_00402020[4];\n\n"
+        "extern HGDIOBJ g_fixture_handle_00402030;\n\n"
         "#endif\n",
     )
     write_fixture(
@@ -644,7 +645,7 @@ typedef struct tagRECT {
     bool result;
     ExistingFixtureAction();
     puts(s_fixture_text_00403000);
-    result = DAT_00402010[param_1] + DAT_00409999;
+    result = DAT_00402010[param_1] + DAT_00402030 * 4 + DAT_00409999;
     return result;
 }
 """
@@ -664,6 +665,8 @@ typedef struct tagRECT {
                 "int CalculateFixtureTotal(int count, RECT *bounds, long unused_flags)",
             )
             self.assertIn("g_fixture_value_00402010[count]", candidate.source)
+            self.assertIn("(*(int *)0x00402030) * 4", candidate.source)
+            self.assertNotIn("g_fixture_handle_00402030", candidate.source)
             self.assertIn("(*(int *)0x00409999)", candidate.source)
             self.assertIn('puts("fixture text");', candidate.source)
             self.assertNotIn("s_fixture_text_00403000", candidate.source)
