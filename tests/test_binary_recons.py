@@ -635,6 +635,93 @@ int ReadFixtureValue(void)
                 )
             )
 
+    def test_similarity_prompt_reports_a_measured_non_improving_edit(self) -> None:
+        class FakeClient:
+            prompts: list[str] = []
+
+            def __init__(self, *args: object):
+                pass
+
+            def improve_similarity(self, prompt: str, round_number: int):
+                type(self).prompts.append(prompt)
+                if round_number == 1:
+                    return (
+                        SimilarityPatch(
+                            edit=ExactEdit(old="return 7;", new="return 6;")
+                        ),
+                        {},
+                    )
+                if round_number == 2:
+                    if "MEASURED NON-IMPROVING PATCH" not in prompt:
+                        raise AssertionError("measured no-op feedback was omitted")
+                    return (
+                        SimilarityPatch(
+                            edit=ExactEdit(old="return 6;", new="return 8;")
+                        ),
+                        {},
+                    )
+                raise AssertionError("unexpected similarity round")
+
+            def close(self) -> None:
+                pass
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            make_fixture_project(root, "return 8;")
+            write_fixture(
+                root,
+                "src/sample.c",
+                """/* Function start: 0x401000 */
+int ReadFixtureValue(void)
+{
+    return 7;
+}
+""",
+            )
+            write_fixture(
+                root,
+                "include/functions.h",
+                "int ReadFixtureValue(void); /* 0x00401000 */\n",
+            )
+
+            def compare(
+                repository_self: ProjectRepository,
+                target: object,
+                timeout: object,
+            ):
+                source = (root / "src/sample.c").read_text(encoding="utf-8")
+                score = 90.0 if "return 8;" in source else 70.0
+                return score, "ADD EAX,1 | SUB EAX,1\nSimilarity: %.2f%%" % score
+
+            with (
+                patch.object(ProjectRepository, "compare", compare),
+                patch("binary_recons.search.ManagedLlamaServer", FakeManagedServer),
+                patch("binary_recons.search.StructuredModelClient", FakeClient),
+                patch("binary_recons.cli.DEFAULT_MODEL_PATH", None),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                result = main(
+                    [
+                        "--project-root",
+                        str(root),
+                        "--address",
+                        "0x401000",
+                        "--max-edits",
+                        "2",
+                        "--target-score",
+                        "80",
+                    ]
+                )
+
+            self.assertEqual(result, 0)
+            self.assertEqual(len(FakeClient.prompts), 2)
+            self.assertIn("return 6;", FakeClient.prompts[1])
+            self.assertIn("Similarity 70.00% -> 70.00%", FakeClient.prompts[1])
+            self.assertIn(
+                "return 8;",
+                (root / "src/sample.c").read_text(encoding="utf-8"),
+            )
+
     def test_reopen_contract_hides_the_existing_weak_name(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

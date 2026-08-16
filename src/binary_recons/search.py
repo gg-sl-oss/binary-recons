@@ -710,6 +710,7 @@ class ReconstructionSearch:
                                 continue
 
                             try:
+                                previous_score = working.score
                                 trial_candidate = apply_source_patch(
                                     working.candidate,
                                     patch,
@@ -757,7 +758,26 @@ class ReconstructionSearch:
                                 patch_metrics(trial.candidate, patch),
                             )
                             working = trial
-                            rejection_history.clear()
+                            if (
+                                kind == "similarity"
+                                and previous_score is not None
+                                and trial.score is not None
+                                and trial.score <= previous_score
+                            ):
+                                rejection_history.append(
+                                    "MEASURED NON-IMPROVING PATCH (already applied "
+                                    "to CURRENT SOURCE): %s\nSimilarity %.2f%% -> "
+                                    "%.2f%%. Do not repeat this edit or an equivalent "
+                                    "source-form experiment; choose a different "
+                                    "instruction-shape mismatch."
+                                    % (
+                                        patch.model_dump_json(),
+                                        previous_score,
+                                        trial.score,
+                                    )
+                                )
+                            else:
+                                rejection_history.clear()
                             if trial.score is not None and (
                                 best_evaluation is None
                                 or best_evaluation.score is None

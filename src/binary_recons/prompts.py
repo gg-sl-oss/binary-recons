@@ -134,7 +134,7 @@ def build_compile_patch_prompt(
 BUILD OR SOURCE-SAFETY FEEDBACK FOR THE CURRENT DRAFT
 {compiler_feedback.strip()}
 
-PREVIOUS INVALID PATCH
+RECENT INVALID OR UNHELPFUL PATCHES
 {_excerpt(rejection, 3500)}
 
 TASK
@@ -226,7 +226,7 @@ DIFF ORIENTATION
 Each comparison row is `current compiler output | original binary`. Relocated
 instruction and data addresses are not source mismatches.
 
-PREVIOUS INVALID PATCH
+RECENT INVALID OR UNHELPFUL PATCHES
 {_excerpt(rejection, 3500)}
 
 TASK
@@ -244,6 +244,10 @@ PATCH CONTRACT
 - Use mode `once` unless all occurrences are independently evidenced as wrong.
 - A patch rejected before measurement is blacklisted. Never repeat its
   `old`/`new` edit; choose a different source region or source shape.
+- A measured non-improving patch listed above is also blacklisted together with
+  equivalent constant/index substitutions that preserve the same instruction
+  shape. It is already present in CURRENT SOURCE because the trajectory follows
+  valid edits; move to a different mismatch rather than reverting or varying it.
 - Do not spend a turn on a global/field rename or constant-address substitution
   when it leaves the compiler's instruction shape unchanged.
 - Never introduce an absolute-address pointer expression. Keep every memory
