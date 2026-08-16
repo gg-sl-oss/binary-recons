@@ -79,6 +79,7 @@ prototype_file = "include/functions.h"
 rule_profiles = ["c89", "msvc4-od"]
 prompt_files = ["RECONSTRUCTION.md"]
 compare_command = ["make", "compare-func", "FUNC={symbol}", "ADDR={address_hex}"]
+skip_addresses = [0x00408000]
 
 [[source_units]]
 path = "src/game.c"
@@ -90,6 +91,9 @@ end = 0x0040ffff
 Keep compiler runtime and third-party library address ranges outside it. When
 `--next-function` is used, the tool never searches beyond these configured
 ranges and considers only exports without an existing source marker.
+`skip_addresses` records missing targets deliberately deferred as unsuitable for
+bounded automatic passes. It affects only `--next-function`; an explicit
+`--address` can still revisit one.
 
 The comparison command may use `{symbol}`, `{address}`, and `{address_hex}`. It
 must compile the current source and print a `Similarity: N%` line from the

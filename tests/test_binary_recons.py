@@ -430,6 +430,46 @@ int ExistingFunction(void)
                 0x00401010,
             )
 
+    def test_next_target_skips_configured_deferred_addresses(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            make_fixture_project(root)
+            config_path = root / "binary-recons.toml"
+            config = config_path.read_text(encoding="utf-8")
+            config = config.replace(
+                "\n[[support_files]]",
+                "\nskip_addresses = [0x00401010]\n\n[[support_files]]",
+                1,
+            )
+            config_path.write_text(config, encoding="utf-8")
+            write_fixture(
+                root,
+                "src/sample.c",
+                "/* Function start: 0x401000 */\n"
+                "int ExistingFunction(void)\n"
+                "{\n"
+                "    return 0;\n"
+                "}\n",
+            )
+            for address in (0x00401010, 0x00401020):
+                write_fixture(
+                    root,
+                    "analysis/FUN_%08X.disassembled.txt" % address,
+                    "Function: FUN_%08X\nRET\n" % address,
+                )
+                write_fixture(
+                    root,
+                    "analysis/FUN_%08X.decompiled.txt" % address,
+                    "void FUN_%08X(void) {}\n" % address,
+                )
+
+            repository = ProjectRepository(root)
+            self.assertEqual(
+                repository.next_unreconstructed_address(),
+                0x00401020,
+            )
+            self.assertEqual(repository.resolve_target(0x00401010).address, 0x00401010)
+
     def test_next_target_requires_an_explicit_safe_range(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

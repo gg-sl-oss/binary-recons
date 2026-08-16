@@ -78,6 +78,7 @@ class ProjectConfig(BaseModel):
     support_files: list[SupportFile] = Field(default_factory=list)
     compare_command: list[str] = Field(min_length=1)
     source_units: list[SourceUnit] = Field(default_factory=list)
+    skip_addresses: list[int] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_support_files(self) -> "ProjectConfig":
@@ -88,6 +89,10 @@ class ProjectConfig(BaseModel):
             raise ValueError(
                 "prototype_file is managed separately and cannot be a support file"
             )
+        if len(self.skip_addresses) != len(set(self.skip_addresses)):
+            raise ValueError("skip_addresses must be unique")
+        if any(address < 0 for address in self.skip_addresses):
+            raise ValueError("skip_addresses cannot contain negative addresses")
         return self
 
     def resolve(self, root: Path, path: Path) -> Path:

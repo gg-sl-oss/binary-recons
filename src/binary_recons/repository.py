@@ -342,11 +342,14 @@ class ProjectRepository:
             raise RuntimeError("missing exports directory: %s" % exports)
 
         candidates: set[int] = set()
+        skipped = set(self.config.skip_addresses)
         for assembly_path in exports.glob("FUN_*.disassembled.txt"):
             match = ASSEMBLY_EXPORT_RE.fullmatch(assembly_path.name)
             if match is None:
                 continue
             address = int(match.group(1), 16)
+            if address in skipped:
+                continue
             if not any(
                 unit.start <= address <= unit.end for unit in self.config.source_units
             ):
