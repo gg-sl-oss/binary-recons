@@ -321,6 +321,20 @@ def normalize_decompiler_seed(
                 % (target_token, contract.symbol, count)
             )
 
+    string_literals = _string_address_literals(repository)
+    for address, literal in string_literals.items():
+        source, count = re.subn(
+            r"&\s*_*(?:DAT)_%08X\b" % address,
+            lambda _match, value=literal: value,
+            source,
+            flags=re.I,
+        )
+        if count:
+            changes.append(
+                "data pointer at 0x%08X -> configured string literal (%d)"
+                % (address, count)
+            )
+
     address_symbols = declaration_address_symbols(repository, excluded_address)
     declaration_lines = _declaration_lines_by_symbol(repository)
     operational = list(
@@ -357,7 +371,6 @@ def normalize_decompiler_seed(
                 % (token, replacement, address_count, value_count)
             )
 
-    string_literals = _string_address_literals(repository)
     string_tokens = list(
         dict.fromkeys(re.findall(r"\bs_[A-Za-z0-9_]*_([0-9A-Fa-f]{8})\b", source))
     )

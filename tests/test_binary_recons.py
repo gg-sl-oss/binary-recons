@@ -959,6 +959,7 @@ typedef struct tagRECT {
     bool result;
     ExistingFixtureAction();
     puts(s_fixture_text_00403000);
+    puts(&DAT_00403000);
     result = DAT_00402010[param_1] + DAT_00402030 * 4 + DAT_00409999;
     return result;
 }
@@ -983,7 +984,7 @@ typedef struct tagRECT {
             self.assertNotIn("g_fixture_handle_00402030", candidate.source)
             self.assertIn("DAT_00409999", candidate.source)
             self.assertNotIn("(int *)0x", candidate.source)
-            self.assertIn('puts("fixture text");', candidate.source)
+            self.assertEqual(candidate.source.count('puts("fixture text");'), 2)
             self.assertNotIn("s_fixture_text_00403000", candidate.source)
             self.assertIn("int result;", candidate.source)
             self.assertNotIn("param_1", candidate.source)

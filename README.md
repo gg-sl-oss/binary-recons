@@ -21,8 +21,8 @@ For a new function, one run performs these stages:
 2. Ask Qwen only for a meaningful function name and complete C prototype.
 3. Build the first candidate mechanically from Ghidra: align parameter names,
    normalize configured historical-C spellings, map compatible address-backed
-   declarations, and leave unresolved globals for a mandatory source-level
-   repair.
+   declarations and exact-address string literals, and leave unresolved globals
+   for a mandatory source-level repair.
 4. Enforce the source-safety gate, then apply the candidate as a transaction,
    compile it, and run the project's configured assembly comparison command.
 5. If compilation fails, put the compact compiler diagnostics first in a Qwen
