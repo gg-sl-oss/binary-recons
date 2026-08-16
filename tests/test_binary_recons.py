@@ -633,7 +633,8 @@ typedef struct tagRECT {
                 ContractProposal(
                     symbol="CalculateFixtureTotal",
                     prototype=(
-                        "bool CalculateFixtureTotal(int count, tagRECT *bounds)"
+                        "bool CalculateFixtureTotal(int count, tagRECT *bounds, "
+                        "long unused_flags)"
                     ),
                 ),
                 repository,
@@ -660,7 +661,7 @@ typedef struct tagRECT {
             )
             self.assertEqual(
                 candidate.prototype,
-                "int CalculateFixtureTotal(int count, RECT *bounds)",
+                "int CalculateFixtureTotal(int count, RECT *bounds, long unused_flags)",
             )
             self.assertIn("g_fixture_value_00402010[count]", candidate.source)
             self.assertIn("(*(int *)0x00409999)", candidate.source)

@@ -249,16 +249,22 @@ def normalize_decompiler_seed(
     brace = source.find("{")
     seed_parameters = _parameter_names(source[:brace] if brace >= 0 else source)
     contract_parameters = _parameter_names(contract.prototype)
-    if (
-        seed_parameters is not None
-        and contract_parameters is not None
-        and len(seed_parameters) == len(contract_parameters)
-    ):
-        renames = [
-            (old, new)
-            for old, new in zip(seed_parameters, contract_parameters, strict=True)
-            if old != new
-        ]
+    if seed_parameters is not None and contract_parameters is not None:
+        renames: list[tuple[str, str]] = []
+        equal_counts = len(seed_parameters) == len(contract_parameters)
+        for position, old in enumerate(seed_parameters):
+            ordinal = re.fullmatch(r"param_(\d+)", old)
+            if ordinal is not None:
+                contract_position = int(ordinal.group(1)) - 1
+            elif equal_counts:
+                contract_position = position
+            else:
+                continue
+            if contract_position < 0 or contract_position >= len(contract_parameters):
+                continue
+            new = contract_parameters[contract_position]
+            if old != new:
+                renames.append((old, new))
         if renames:
             source = _replace_identifiers(source, renames)
             changes.extend(
