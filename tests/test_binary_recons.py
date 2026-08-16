@@ -577,7 +577,10 @@ int ReadFixtureValue(void)
         self.assertNotEqual(candidate_fingerprint(first), candidate_fingerprint(second))
 
     def test_feedback_distinguishes_compiler_errors_and_compacts_assembly(self) -> None:
-        compiler = "sample.c(4) : error C2065: 'missing' : undeclared identifier"
+        compiler = (
+            "sample.c(3) : warning C4013: 'other' undefined\n"
+            "sample.c(4) : error C2065: 'missing' : undeclared identifier"
+        )
         comparison = """Comparison for function ReadFixtureValue
 0x401000: MOV EAX,0x500000 | 0x500000: MOV EAX,0x600000
 0x401005: ADD EAX,1 | 0x500005: SUB EAX,1
@@ -585,6 +588,9 @@ Similarity: 70.00%
 """
         self.assertTrue(ProjectRepository.has_compiler_errors(compiler))
         self.assertEqual(ProjectRepository.compiler_error_count(compiler), 1)
+        compile_feedback = ProjectRepository.compact_feedback(compiler, None)
+        self.assertTrue(compile_feedback.startswith("sample.c(4) : error C2065"))
+        self.assertNotIn("warning C4013", compile_feedback)
         compact = ProjectRepository.compact_similarity_feedback(comparison)
         self.assertIn("ADD EAX,1", compact)
         self.assertNotIn("MOV EAX", compact)

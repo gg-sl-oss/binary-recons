@@ -848,6 +848,12 @@ class ProjectRepository:
                 or "Similarity:" in line
             ]
             return "\n".join(selected)[-9000:]
+        errors = [line for line in lines if COMPILER_ERROR_RE.search(line)]
+        if errors:
+            # Warnings often precede the first fatal diagnostic in historical
+            # compiler output.  A bounded compile-only turn must spend its one
+            # edit on an actual blocker, not on an earlier harmless warning.
+            return "\n".join(errors)[-6000:]
         selected = [
             line
             for line in lines
