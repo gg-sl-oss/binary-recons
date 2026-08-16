@@ -84,6 +84,8 @@ def _spelling_replacements(
         replacements.update(_C89_REPLACEMENTS)
     if "Microsoft Visual C++ 4" in repository.config.compiler:
         replacements["undefined8"] = "unsigned __int64"
+        replacements["unsigned long long"] = "unsigned __int64"
+        replacements["long long"] = "__int64"
         replacements["longlong"] = "__int64"
         replacements["ulonglong"] = "unsigned __int64"
     else:

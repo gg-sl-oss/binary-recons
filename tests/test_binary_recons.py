@@ -996,6 +996,7 @@ typedef struct tagRECT {
             source = """undefined4 FUN_00401000(int param_1, tagRECT *param_2)
 {
     bool result;
+    long long accumulator;
     ExistingFixtureAction();
     puts(s_fixture_text_00403000);
     puts(&DAT_00403000);
@@ -1026,6 +1027,8 @@ typedef struct tagRECT {
             self.assertEqual(candidate.source.count('puts("fixture text");'), 2)
             self.assertNotIn("s_fixture_text_00403000", candidate.source)
             self.assertIn("int result;", candidate.source)
+            self.assertIn("__int64 accumulator;", candidate.source)
+            self.assertNotIn("long long", candidate.source)
             self.assertNotIn("param_1", candidate.source)
             self.assertTrue(
                 any("parameter param_1 -> count" in item for item in changes)
