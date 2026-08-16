@@ -39,7 +39,12 @@ from .seed import (
     normalize_decompiler_seed,
     normalize_resumed_candidate,
 )
-from .source_edits import apply_source_patch, patch_metrics, sanitize_source_patch
+from .source_edits import (
+    apply_source_patch,
+    bind_supporting_address_symbols,
+    patch_metrics,
+    sanitize_source_patch,
+)
 
 
 @dataclass(frozen=True)
@@ -243,6 +248,13 @@ class ReconstructionSearch:
             self.repository,
             self.target.address,
         )
+        bound_source, binding_changes = bind_supporting_address_symbols(
+            candidate.source,
+            candidate.supporting_insertions,
+        )
+        if binding_changes:
+            candidate = candidate.model_copy(update={"source": bound_source})
+            changes.extend(binding_changes)
         if self.target.has_contract:
             if (
                 candidate.symbol != self.target.symbol

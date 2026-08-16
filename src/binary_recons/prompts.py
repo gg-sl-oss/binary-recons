@@ -164,6 +164,10 @@ PATCH CONTRACT
   definition to the explicitly configured global files. Follow the project's
   naming/address convention. Never invent a generic `unknown`, `data`, or
   `value` name merely to compile.
+- When a paired declaration preserves its address in the meaningful symbol,
+  the driver mechanically propagates that model-chosen name to unambiguous
+  DAT/PTR/UNK uses and fixed-width array elements. Choose the correct type,
+  base address, and array length; do not spend separate turns renaming each use.
 - `supporting_insertions` are never a way to add a local or edit the target
   source file. For a C89 `for (int i = ...)` error, use the exact source edit to
   declare `i` with the function's locals; a later repair can remove `int` from

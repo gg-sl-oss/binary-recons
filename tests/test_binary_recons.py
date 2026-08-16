@@ -65,6 +65,7 @@ from binary_recons.seed import (  # noqa: E402
 )
 from binary_recons.source_edits import (  # noqa: E402
     apply_source_patch,
+    bind_supporting_address_symbols,
     sanitize_source_patch,
 )
 
@@ -1028,6 +1029,15 @@ void CheckFixtureScore(void)
         self.assertTrue(any("0x00414980" in item for item in violations))
         self.assertTrue(any("0x00416688" in item for item in violations))
         self.assertTrue(any("DAT_0041560c" in item for item in violations))
+        underscored = candidate.model_copy(
+            update={"source": candidate.source.replace("DAT_0041560c", "_DAT_0041560c")}
+        )
+        self.assertTrue(
+            any(
+                "_DAT_0041560c" in item
+                for item in source_safety_violations(underscored)
+            )
+        )
         feedback = source_safety_feedback(candidate)
         self.assertIsNotNone(feedback)
         self.assertIn("SOURCE SAFETY ERROR:", feedback or "")
@@ -1171,6 +1181,47 @@ int ReadFixtureValue(void)
         )
         self.assertIn("g_fixture_score_00402040", repaired.source)
         self.assertEqual(len(repaired.supporting_insertions), 2)
+
+    def test_paired_support_declarations_bind_address_backed_array_uses(self) -> None:
+        source = """/* Function start: 0x401000 */
+HGDIOBJ ReadFixtureFrame(int frameIndex)
+{
+    DeleteObject(DAT_00402040);
+    DeleteObject(_DAT_00402044);
+    return *(HGDIOBJ *)(&DAT_00402040 + frameIndex * 4);
+}"""
+        insertions = [
+            SupportingInsertion(
+                path="include/globals.h",
+                content="extern HGDIOBJ g_fixtureFrames_00402040[2];",
+            ),
+            SupportingInsertion(
+                path="src/globals.c",
+                content="HGDIOBJ g_fixtureFrames_00402040[2];",
+            ),
+        ]
+
+        bound, changes = bind_supporting_address_symbols(source, insertions)
+
+        self.assertIn("DeleteObject(g_fixtureFrames_00402040[0]);", bound)
+        self.assertIn("DeleteObject(g_fixtureFrames_00402040[1]);", bound)
+        self.assertIn("return g_fixtureFrames_00402040[frameIndex];", bound)
+        self.assertNotIn("DAT_", bound)
+        self.assertTrue(changes)
+
+    def test_address_binding_requires_a_paired_declaration(self) -> None:
+        source = "return DAT_00402040;"
+        bound, changes = bind_supporting_address_symbols(
+            source,
+            [
+                SupportingInsertion(
+                    path="include/globals.h",
+                    content="extern int g_fixtureValue_00402040;",
+                )
+            ],
+        )
+        self.assertEqual(bound, source)
+        self.assertEqual(changes, [])
 
 
 class StagedSearchTests(unittest.TestCase):

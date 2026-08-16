@@ -205,7 +205,11 @@ exceptions, interrupts, timeouts, invalid patches, stale exact text,
 brace-balance changes, operational-name reintroductions, and absolute-address
 pointer expressions cannot overwrite the retained best. Unsafe Ghidra seeds can
 advance through incremental safety repairs in memory, but are never built,
-scored, or selected.
+scored, or selected. When Qwen supplies a matching extern/definition pair whose
+meaningful symbol retains the binary address suffix, the driver propagates that
+model-chosen name to unambiguous decompiler globals and fixed-width array
+elements. This keeps address cleanup transactional without spending a separate
+model request on every occurrence.
 
 Runs are stored under the configured `output_dir`, grouped by model, address,
 and timestamp. A run records:

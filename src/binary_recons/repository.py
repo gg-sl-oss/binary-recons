@@ -40,7 +40,10 @@ _ABSOLUTE_POINTER_RE = re.compile(
     r")"
     r"(?P<address>0[xX][0-9A-Fa-f]{6,16}|[1-9][0-9]{5,})",
 )
-_UNRESOLVED_GLOBAL_RE = re.compile(r"\b(?:DAT|PTR|UNK)_[0-9A-Fa-f]{6,16}\b")
+_UNRESOLVED_GLOBAL_RE = re.compile(
+    r"(?<![A-Za-z0-9_])_*(?:DAT|PTR|UNK)_[0-9A-Fa-f]{6,16}"
+    r"(?![A-Za-z0-9_])"
+)
 _C_NON_CODE_RE = re.compile(
     r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|//[^\n]*|/\*.*?\*/',
     re.S,

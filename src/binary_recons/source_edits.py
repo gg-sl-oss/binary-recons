@@ -15,7 +15,20 @@ from .repository import absolute_pointer_casts
 from .seed import candidate_from_seed
 
 
-_OPERATIONAL_IDENTIFIER_RE = re.compile(r"\b(?:DAT|FUN)_[0-9A-Fa-f]{8}\b")
+_OPERATIONAL_IDENTIFIER_RE = re.compile(
+    r"(?<![A-Za-z0-9_])_*(?:DAT|FUN|PTR|UNK)_[0-9A-Fa-f]{6,16}"
+    r"(?![A-Za-z0-9_])"
+)
+_UNRESOLVED_ADDRESS_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_])"
+    r"(?P<token>_*(?:DAT|PTR|UNK)_(?P<address>[0-9A-Fa-f]{6,16}))"
+    r"(?![A-Za-z0-9_])"
+)
+_DECLARED_ADDRESS_SYMBOL_RE = re.compile(
+    r"\b(?P<symbol>[A-Za-z_][A-Za-z0-9_]*_"
+    r"(?P<address>[0-9A-Fa-f]{6,16}))\b"
+    r"\s*(?:\[\s*(?P<count>[1-9][0-9]*)\s*\])?\s*$"
+)
 
 
 def _unsafe_new_text(text: str) -> str | None:
@@ -52,6 +65,133 @@ def _merge_supporting_insertions(
             content=existing.content.rstrip() + "\n\n" + addition.content,
         )
     return merged
+
+
+def _declaration_element_size(prefix: str) -> int | None:
+    """Return conservative Win32 sizes for simple array element declarations."""
+
+    if "*" in prefix:
+        return 4
+    tokens = set(re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", prefix))
+    if "__int64" in tokens or "double" in tokens:
+        return 8
+    if "char" in tokens or tokens & {"BYTE", "CHAR", "UCHAR"}:
+        return 1
+    if "short" in tokens or tokens & {"WORD", "WCHAR", "USHORT"}:
+        return 2
+    if tokens & {
+        "int",
+        "long",
+        "float",
+        "BOOL",
+        "DWORD",
+        "INT",
+        "LONG",
+        "UINT",
+        "ULONG",
+    }:
+        return 4
+    if any(re.fullmatch(r"H[A-Z][A-Z0-9_]*", token) for token in tokens):
+        return 4
+    return None
+
+
+def _paired_address_objects(
+    insertions: list[SupportingInsertion],
+) -> list[tuple[str, int, int | None, int | None]]:
+    """Read address-backed declarations present in at least two support files."""
+
+    declarations: dict[tuple[str, int, int | None, int | None], set[str]] = {}
+    for insertion in insertions:
+        for raw_statement in insertion.content.split(";"):
+            statement = raw_statement.strip()
+            match = _DECLARED_ADDRESS_SYMBOL_RE.search(statement)
+            if match is None:
+                continue
+            symbol = match.group("symbol")
+            address = int(match.group("address"), 16)
+            count_text = match.group("count")
+            count = int(count_text) if count_text is not None else None
+            width = (
+                _declaration_element_size(statement[: match.start()])
+                if count is not None
+                else None
+            )
+            key = (symbol, address, count, width)
+            declarations.setdefault(key, set()).add(insertion.path)
+    return [key for key, paths in declarations.items() if len(paths) >= 2]
+
+
+def bind_supporting_address_symbols(
+    source: str,
+    insertions: list[SupportingInsertion],
+) -> tuple[str, list[str]]:
+    """Propagate model-chosen paired globals to matching decompiler tokens.
+
+    The model remains responsible for the meaningful name, type, array base,
+    and array length. The driver only performs address-preserving substitutions
+    that are unambiguous from the paired extern and definition.
+    """
+
+    objects = _paired_address_objects(insertions)
+    changes: list[str] = []
+
+    arrays_by_base: dict[int, set[tuple[str, int, int]]] = {}
+    for symbol, address, count, width in objects:
+        if count is not None and width is not None:
+            arrays_by_base.setdefault(address, set()).add((symbol, count, width))
+    for address, arrays in arrays_by_base.items():
+        if len(arrays) != 1:
+            continue
+        symbol, _count, width = next(iter(arrays))
+        token = (
+            r"(?<![A-Za-z0-9_])_*(?:DAT|PTR|UNK)_%08X"
+            r"(?![A-Za-z0-9_])" % address
+        )
+        pointer_index = re.compile(
+            r"\*\s*\(\s*[^()\n;{}]*\*\s*\)\s*"
+            r"\(\s*&\s*"
+            + token
+            + r"\s*\+\s*(?P<index>[A-Za-z_][A-Za-z0-9_]*)"
+            + r"\s*\*\s*%d\s*\)" % width,
+            re.I,
+        )
+        source, count = pointer_index.subn(
+            lambda match: "%s[%s]" % (symbol, match.group("index")),
+            source,
+        )
+        if count:
+            changes.append(
+                "address arithmetic at 0x%08X -> %s[index] (%d)"
+                % (address, symbol, count)
+            )
+
+    operational = list(_UNRESOLVED_ADDRESS_TOKEN_RE.finditer(source))
+    for match in operational:
+        token = match.group("token")
+        address = int(match.group("address"), 16)
+        replacements: set[str] = set()
+        for symbol, base, count, width in objects:
+            if count is None:
+                if address == base:
+                    replacements.add(symbol)
+                continue
+            if address == base:
+                replacements.add("%s[0]" % symbol)
+                continue
+            if width is None:
+                continue
+            offset = address - base
+            if 0 < offset < count * width and offset % width == 0:
+                replacements.add("%s[%d]" % (symbol, offset // width))
+        if len(replacements) != 1:
+            continue
+        replacement = next(iter(replacements))
+        pattern = re.compile(r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % re.escape(token))
+        source, count = pattern.subn(replacement, source)
+        if count:
+            changes.append("%s -> %s (%d)" % (token, replacement, count))
+    return source, changes
 
 
 def sanitize_source_patch(
@@ -158,14 +298,19 @@ def apply_source_patch(
             raise ValueError(
                 "identifier replacement %d old token does not occur" % index
             )
+    supporting_insertions = _merge_supporting_insertions(
+        candidate.supporting_insertions,
+        patch.supporting_insertions,
+    )
+    source, _binding_changes = bind_supporting_address_symbols(
+        source,
+        supporting_insertions,
+    )
     return candidate_from_seed(
         source,
         contract=_candidate_contract(candidate),
         address=address,
-        supporting_insertions=_merge_supporting_insertions(
-            candidate.supporting_insertions,
-            patch.supporting_insertions,
-        ),
+        supporting_insertions=supporting_insertions,
     )
 
 
