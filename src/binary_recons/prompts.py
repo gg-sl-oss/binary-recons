@@ -10,6 +10,8 @@ You assist a deterministic binary source-reconstruction driver. Return only the
 requested structured data. Never return analysis, Markdown, a whole replacement
 function, shell commands, tool calls, or unrelated edits. Original assembly and
 compiler feedback are authoritative; decompiled C is only a semantic seed.
+Never turn a decompiler global into a cast of a numeric absolute address. Source
+output must use meaningful declared globals, aggregate elements, or fields.
 """
 
 
@@ -17,6 +19,15 @@ def _excerpt(text: str, limit: int = 8000) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + "\n... prompt context mechanically truncated ..."
+
+
+def _pending_support(candidate: Candidate) -> str:
+    if not candidate.supporting_insertions:
+        return "No supporting declarations or definitions are pending."
+    return "\n\n".join(
+        "[%s]\n%s" % (insertion.path, insertion.content)
+        for insertion in candidate.supporting_insertions
+    )
 
 
 def build_contract_prompt(target: TargetSpec, evidence: EvidenceBundle) -> str:
@@ -114,35 +125,53 @@ def build_compile_patch_prompt(
     compiler_feedback: str,
     previous_rejection: str = "",
 ) -> str:
-    """Put the failing compiler output first so a weak model sees the root cause."""
+    """Put blocking build or source-safety feedback before the draft."""
 
-    rejection = previous_rejection or "No earlier patch was rejected."
+    rejection = (
+        previous_rejection or "No earlier patch was rejected before measurement."
+    )
     return f"""\
-COMPILER FEEDBACK FOR THE CURRENT DRAFT
+BUILD OR SOURCE-SAFETY FEEDBACK FOR THE CURRENT DRAFT
 {compiler_feedback.strip()}
 
-PREVIOUS PATCH REJECTION
+PREVIOUS INVALID PATCH
 {_excerpt(rejection, 3500)}
 
 TASK
-Fix only the first compiler root cause with the smallest possible source patch.
-This is a COMPILE-ONLY pass: do not inspect or tune assembly, rename the target,
-change its prototype, regenerate the function, or edit another file. Return
-SOURCE PATCH DATA ONLY.
+Fix only the first blocking compiler or source-safety root cause with the
+smallest possible source patch. This is a COMPILE/SAFETY pass: do not inspect or
+tune assembly, rename the target, change its prototype, or regenerate the
+function. Return SOURCE PATCH DATA ONLY.
 
 PATCH CONTRACT
 - The driver accepts at most one exact edit plus up to eight whole-token
-  identifier replacements.
+  identifier replacements and three configured supporting insertions.
 - Exact `old` text must occur verbatim. Use mode `once` unless every occurrence
   is independently wrong.
 - Use identifier replacements only for simple existing-token renames.
 - Pointer arithmetic and imperfect types may remain when they compile.
 - The exact first blocking source line is supplied above. Patch that line or a
   token used by it; do not spend this turn cleaning up an unrelated warning.
-- Prefer supplied declarations. If an unresolved DAT/global has no declaration,
-  replace that identifier with a short typed absolute-address lvalue expression.
-- Do not add behavior, a helper, a declaration, an include, a macro, Markdown,
-  or an operational FUN_/DAT_ identifier.
+- A numeric address cast to a pointer is always forbidden, even when it compiles
+  or produces matching assembly. Never emit `*(type *)0x...`, `(type *)0x...`,
+  or an address-based pointer-arithmetic variant.
+- Replace unresolved DAT/PTR/UNK globals with meaningful source-level globals,
+  aggregate elements, or fields. Prefer a compatible supplied declaration. An
+  address inside a declared array/structure must be expressed through that
+  aggregate, not as a new pointer.
+- If the evidence requires a genuinely undeclared standalone global, use
+  `supporting_insertions` to add its meaningful extern declaration and matching
+  definition to the explicitly configured global files. Follow the project's
+  naming/address convention. Never invent a generic `unknown`, `data`, or
+  `value` name merely to compile.
+- `supporting_insertions` are never a way to add a local or edit the target
+  source file. For a C89 `for (int i = ...)` error, use the exact source edit to
+  declare `i` with the function's locals; a later repair can remove `int` from
+  the loop initializer if both locations do not fit in one exact edit.
+- When one unsafe address repeats, repair every occurrence that fits the same
+  evidenced source-level object in this patch.
+- Do not add behavior, a helper, an include, a macro, Markdown, or an operational
+  FUN_/DAT_/PTR_/UNK_ identifier.
 
 LOCKED FUNCTION CONTRACT
 {candidate.prototype}
@@ -155,6 +184,12 @@ GHIDRA DECOMPILATION (BEHAVIOR HINT)
 
 RELEVANT EXISTING DECLARATIONS
 {_excerpt(evidence.declaration_evidence, 5000)}
+
+CONFIGURED SUPPORT FILES
+{_excerpt(evidence.supporting_file_evidence, 7000)}
+
+CURRENT PENDING SUPPORT INSERTIONS
+{_excerpt(_pending_support(candidate), 4000)}
 
 DIRECT-CALLEE EVIDENCE
 {_excerpt(evidence.callee_evidence, 3500)}
@@ -176,7 +211,9 @@ def build_similarity_patch_prompt(
 ) -> str:
     """Ask for one evidence-backed source experiment against the current diff."""
 
-    rejection = previous_rejection or "No earlier patch was rejected."
+    rejection = (
+        previous_rejection or "No earlier patch was rejected before measurement."
+    )
     return f"""\
 LATEST BINARY-COMP FEEDBACK (AUTHORITATIVE)
 {comparison_feedback.strip()}
@@ -185,7 +222,7 @@ DIFF ORIENTATION
 Each comparison row is `current compiler output | original binary`. Relocated
 instruction and data addresses are not source mismatches.
 
-PREVIOUS PATCH REJECTION
+PREVIOUS INVALID PATCH
 {_excerpt(rejection, 3500)}
 
 TASK
@@ -201,12 +238,15 @@ PATCH CONTRACT
 - The exact `old` text must occur verbatim in the current source.
 - Preserve brace balance, the address marker, and unrelated statements.
 - Use mode `once` unless all occurrences are independently evidenced as wrong.
-- A rejected patch is blacklisted. Never repeat its `old`/`new` edit; choose a
-  different source region or a materially different source shape.
+- A patch rejected before measurement is blacklisted. Never repeat its
+  `old`/`new` edit; choose a different source region or source shape.
 - Do not spend a turn on a global/field rename or constant-address substitution
   when it leaves the compiler's instruction shape unchanged.
-- The driver will compile the trial transactionally and reject it unless its
-  measured similarity strictly increases.
+- Never introduce an absolute-address pointer expression. Keep every memory
+  access expressed through meaningful declared globals, aggregate elements, or
+  fields.
+- The driver follows every valid measured edit as the next working source,
+  while retaining the best compiling candidate separately for final output.
 
 LOCKED FUNCTION CONTRACT
 {candidate.prototype}
@@ -222,6 +262,9 @@ GHIDRA DECOMPILATION (SEMANTIC HINT, NOT AUTHORITATIVE)
 
 RELEVANT EXISTING DECLARATIONS
 {_excerpt(evidence.declaration_evidence, 5000)}
+
+CURRENT PENDING SUPPORT INSERTIONS
+{_excerpt(_pending_support(candidate), 3000)}
 
 DIRECT-CALLEE EVIDENCE
 {_excerpt(evidence.callee_evidence, 2500)}

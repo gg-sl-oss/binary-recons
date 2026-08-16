@@ -13,11 +13,92 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 
 MODEL_ENVIRONMENT_VARIABLE = "BINARY_RECONS_MODEL_PATH"
+DEFAULT_HUGGINGFACE_HUB_CACHE = Path("~/.cache/huggingface/hub")
+_SHARDED_GGUF_RE = re.compile(
+    r"-(?P<shard>\d{5})-of-(?P<count>\d{5})\.gguf$",
+    re.I,
+)
+_AUXILIARY_GGUF_NAMES = ("mmproj", "tokenizer", "vision")
 
 
-def discover_default_model_path() -> Path | None:
+def _cached_model_rank(path: Path) -> tuple[tuple[int, ...], float, int, float, str]:
+    """Prefer newer, larger, higher-fidelity cached Qwen model variants."""
+
+    identity = str(path).lower()
+    version_match = re.search(r"qwen[-_]?([0-9]+(?:\.[0-9]+)*)", identity)
+    version = (
+        tuple(int(part) for part in version_match.group(1).split("."))
+        if version_match is not None
+        else ()
+    )
+    size_match = re.search(r"(?<![0-9.])([0-9]+(?:\.[0-9]+)?)b\b", identity)
+    size = float(size_match.group(1)) if size_match is not None else 0.0
+    fidelity = next(
+        (
+            rank
+            for label, rank in (
+                ("bf16", 9),
+                ("f16", 8),
+                ("q8", 7),
+                ("q6", 6),
+                ("q5", 5),
+                ("q4", 4),
+                ("q3", 3),
+                ("q2", 2),
+            )
+            if label in identity
+        ),
+        0,
+    )
+    try:
+        modified = path.stat().st_mtime
+    except OSError:
+        modified = 0.0
+    return version, size, fidelity, modified, str(path)
+
+
+def _has_all_model_shards(path: Path, shard: re.Match[str]) -> bool:
+    """Reject partially downloaded split GGUFs before llama.cpp sees them."""
+
+    shard_count = int(shard.group("count"))
+    start, end = shard.span("shard")
+    return all(
+        path.with_name(path.name[:start] + f"{index:05d}" + path.name[end:]).is_file()
+        for index in range(1, shard_count + 1)
+    )
+
+
+def discover_cached_qwen_model(cache_root: Path) -> Path | None:
+    """Select a loadable first GGUF shard from a Hugging Face hub cache."""
+
+    cache_root = cache_root.expanduser()
+    if not cache_root.is_dir():
+        return None
+    candidates: list[Path] = []
+    for path in cache_root.glob("models--*/snapshots/**/*.gguf"):
+        identity = str(path).lower()
+        if "qwen" not in identity or any(
+            excluded in path.name.lower() for excluded in _AUXILIARY_GGUF_NAMES
+        ):
+            continue
+        shard = _SHARDED_GGUF_RE.search(path.name)
+        if shard is not None:
+            if int(shard.group("shard")) != 1 or not _has_all_model_shards(path, shard):
+                continue
+        if path.is_file():
+            candidates.append(path)
+    return max(candidates, key=_cached_model_rank) if candidates else None
+
+
+def discover_default_model_path(cache_root: Path | None = None) -> Path | None:
+    """Resolve an explicit model override, then a cached Qwen GGUF."""
+
     configured = os.environ.get(MODEL_ENVIRONMENT_VARIABLE)
-    return Path(configured).expanduser() if configured else None
+    if configured:
+        return Path(configured).expanduser()
+    return discover_cached_qwen_model(
+        cache_root or DEFAULT_HUGGINGFACE_HUB_CACHE,
+    )
 
 
 DEFAULT_MODEL_PATH = discover_default_model_path()
@@ -241,7 +322,7 @@ class ContractProposal(BaseModel):
 
 
 class ExactEdit(BaseModel):
-    """One bounded textual substitution against the current accepted source."""
+    """One bounded textual substitution against the current working source."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -277,6 +358,14 @@ class SourcePatch(BaseModel):
         max_length=8,
     )
     edits: list[ExactEdit] = Field(default_factory=list, max_length=1)
+    supporting_insertions: list[SupportingInsertion] = Field(
+        default_factory=list,
+        max_length=3,
+        description=(
+            "New declarations or definitions needed by a repaired source-level "
+            "global. Use only configured support-file paths."
+        ),
+    )
 
 
 class SimilarityPatch(BaseModel):
@@ -361,7 +450,7 @@ class SearchConfig(BaseModel):
     model: str = "local-model"
     max_edits: int = Field(default=4, ge=0, le=20)
     target_score: float = Field(default=80.0, ge=0.0, le=100.0)
-    max_tokens: int = Field(default=512, ge=64, le=2000)
+    max_tokens: int = Field(default=768, ge=64, le=2000)
     reasoning_effort: Literal["none", "low", "medium"] = "none"
     max_callees: int = Field(default=2, ge=0, le=32)
     request_timeout: float = Field(default=60.0, gt=0)
@@ -464,7 +553,9 @@ class LlamaServerConfig(BaseModel):
             return list(self.command_override)
         if self.model_path is None:
             raise RuntimeError(
-                "no model configured; pass --model-path or set BINARY_RECONS_MODEL_PATH"
+                "no model configured; pass --model-path, set "
+                "BINARY_RECONS_MODEL_PATH, or cache a Qwen GGUF under "
+                "~/.cache/huggingface/hub"
             )
         preset = self.resolved_preset()
         command = [

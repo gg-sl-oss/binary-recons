@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import re
 import subprocess
 from pathlib import Path
@@ -29,7 +27,28 @@ COMPILER_ERROR_RE = re.compile(
     r":\s*error:)",
     re.I | re.M,
 )
+SOURCE_SAFETY_PREFIX = "SOURCE SAFETY ERROR:"
+_ABSOLUTE_POINTER_RE = re.compile(
+    r"(?:"
+    r"\(\s*[^()\n;{}]*\*[^()\n;{}]*\)\s*(?:\(\s*)*"
+    r"|(?:reinterpret_cast|static_cast|const_cast)\s*<[^>\n]*\*[^>\n]*>\s*\(\s*"
+    r"|\(\s*(?:LPC?(?:VOID|STR|WSTR|BYTE|WORD|DWORD|RECT|POINT|MSG)|"
+    r"PC?(?:VOID|STR|WSTR|BYTE|WORD|DWORD|RECT|POINT|MSG)|HANDLE|"
+    r"H(?:WND|INSTANCE|MODULE|GLOBAL|LOCAL|BITMAP|BRUSH|CURSOR|DC|FONT|"
+    r"GDIOBJ|HOOK|ICON|KEY|MENU|PALETTE|PEN|RGN|RSRC))\s*\)\s*(?:\(\s*)*"
+    r"|\*\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*(?:\(\s*)*"
+    r")"
+    r"(?P<address>0[xX][0-9A-Fa-f]{6,16}|[1-9][0-9]{5,})",
+)
+_UNRESOLVED_GLOBAL_RE = re.compile(r"\b(?:DAT|PTR|UNK)_[0-9A-Fa-f]{6,16}\b")
+_C_NON_CODE_RE = re.compile(
+    r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|//[^\n]*|/\*.*?\*/',
+    re.S,
+)
 SOURCE_SUFFIXES = frozenset({".c", ".cc", ".cpp", ".cxx"})
+ASSEMBLY_EXPORT_RE = re.compile(
+    r"^FUN_([0-9A-Fa-f]+)\.disassembled\.txt$",
+)
 GENERIC_FUNCTION_SYMBOL_RE = re.compile(
     r"(?i)^(?:(?:FUN|sub|function|fn)_?[0-9a-f]*|helper|callback|handler|"
     r"routine|procedure|proc|dialogproc|wndproc|windowproc|eventhandler)$"
@@ -38,6 +57,72 @@ GENERIC_FUNCTION_SYMBOL_RE = re.compile(
 
 def is_generic_function_symbol(symbol: str) -> bool:
     return GENERIC_FUNCTION_SYMBOL_RE.fullmatch(symbol) is not None
+
+
+def _source_safety_regions(candidate: Candidate) -> list[tuple[str, str]]:
+    regions = [("target source", candidate.source)]
+    regions.extend(
+        ("support insertion %s" % insertion.path, insertion.content)
+        for insertion in candidate.supporting_insertions
+    )
+    return regions
+
+
+def _mask_c_non_code(text: str) -> str:
+    """Preserve offsets and line numbers while hiding comments and literals."""
+
+    return _C_NON_CODE_RE.sub(
+        lambda match: "".join(
+            "\n" if character == "\n" else " " for character in match.group(0)
+        ),
+        text,
+    )
+
+
+def absolute_pointer_casts(text: str) -> list[tuple[str, int]]:
+    code = _mask_c_non_code(text)
+    return [
+        (match.group("address"), match.start())
+        for match in _ABSOLUTE_POINTER_RE.finditer(code)
+    ]
+
+
+def source_text_safety_violations(text: str, region: str) -> list[str]:
+    violations: list[str] = []
+    code = _mask_c_non_code(text)
+    for address, start in absolute_pointer_casts(text):
+        line = text.count("\n", 0, start) + 1
+        violations.append(
+            "%s line %d uses absolute address %s as a pointer; replace it "
+            "with a declared source-level global, aggregate element, or field"
+            % (region, line, address)
+        )
+    for match in _UNRESOLVED_GLOBAL_RE.finditer(code):
+        line = text.count("\n", 0, match.start()) + 1
+        violations.append(
+            "%s line %d still uses unresolved decompiler global %s; replace "
+            "it with a meaningful declared source-level global, aggregate "
+            "element, or field" % (region, line, match.group(0))
+        )
+    return list(dict.fromkeys(violations))
+
+
+def source_safety_violations(candidate: Candidate) -> list[str]:
+    """Reject decompiler address shortcuts before they can become source output."""
+
+    violations: list[str] = []
+    for region, text in _source_safety_regions(candidate):
+        violations.extend(source_text_safety_violations(text, region))
+    return list(dict.fromkeys(violations))
+
+
+def source_safety_feedback(candidate: Candidate) -> str | None:
+    violations = source_safety_violations(candidate)
+    if not violations:
+        return None
+    return "\n".join(
+        "%s %s" % (SOURCE_SAFETY_PREFIX, violation) for violation in violations[:20]
+    )
 
 
 def declaration_for_symbol(text: str, symbol: str) -> str | None:
@@ -116,27 +201,6 @@ def replace_or_insert_function(source: str, address: int, candidate: str) -> str
                 + source[position:]
             )
     return source.rstrip() + "\n\n" + candidate.rstrip() + "\n"
-
-
-def candidate_fingerprint(candidate: str | Candidate) -> str:
-    if isinstance(candidate, Candidate):
-        candidate = json.dumps(
-            {
-                "symbol": candidate.symbol,
-                "prototype": re.sub(r"\s+", " ", candidate.prototype).strip(),
-                "source": re.sub(r"\s+", " ", candidate.source).strip(),
-                "supporting_insertions": sorted(
-                    (
-                        insertion.path,
-                        re.sub(r"\s+", " ", insertion.content).strip(),
-                    )
-                    for insertion in candidate.supporting_insertions
-                ),
-            },
-            sort_keys=True,
-        )
-    normalized = re.sub(r"\s+", " ", candidate).strip()
-    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 def normalize_candidate_marker(candidate: Candidate, address: int) -> Candidate:
@@ -251,6 +315,67 @@ class ProjectRepository:
     def __init__(self, root: Path, config_path: Path | None = None):
         self.root = root.resolve()
         self.config: ProjectConfig = load_project_config(self.root, config_path)
+
+    def next_unreconstructed_address(self) -> int:
+        """Return the first unsafe reconstruction or unimplemented safe export."""
+
+        if not self.config.source_units:
+            raise RuntimeError(
+                "cannot select the next function safely: configure source_units "
+                "address ranges that exclude CRT and library code"
+            )
+
+        reconstructed: set[int] = set()
+        unsafe_reconstructions: set[int] = set()
+        for directory in self.config.source_paths(self.root):
+            if not directory.exists():
+                continue
+            for path in sorted(directory.rglob("*")):
+                if not path.is_file() or path.suffix.lower() not in SOURCE_SUFFIXES:
+                    continue
+                source = read_text(path)
+                for marker in MARKER_RE.finditer(source):
+                    address = int(marker.group(1), 16)
+                    reconstructed.add(address)
+                    function = current_function(source, address)
+                    if function is not None and source_text_safety_violations(
+                        function,
+                        "target source",
+                    ):
+                        unsafe_reconstructions.add(address)
+
+        exports = self.config.resolve(self.root, self.config.exports_dir)
+        if not exports.is_dir():
+            raise RuntimeError("missing exports directory: %s" % exports)
+
+        candidates: set[int] = set()
+        complete_exports: set[int] = set()
+        for assembly_path in exports.glob("FUN_*.disassembled.txt"):
+            match = ASSEMBLY_EXPORT_RE.fullmatch(assembly_path.name)
+            if match is None:
+                continue
+            address = int(match.group(1), 16)
+            if not any(
+                unit.start <= address <= unit.end for unit in self.config.source_units
+            ):
+                continue
+            decompiled_path = exports / ("FUN_%08X.decompiled.txt" % address)
+            if not decompiled_path.is_file():
+                continue
+            complete_exports.add(address)
+            if address not in reconstructed:
+                candidates.add(address)
+
+        unsafe_candidates = unsafe_reconstructions & complete_exports
+        if unsafe_candidates:
+            return min(unsafe_candidates)
+
+        if not candidates:
+            raise RuntimeError(
+                "no source-unsafe reconstructions or unreconstructed function "
+                "exports remain inside the configured source_units ranges"
+            )
+        return min(candidates)
 
     def resolve_target(
         self,
@@ -857,6 +982,11 @@ class ProjectRepository:
                 or "Similarity:" in line
             ]
             return "\n".join(selected)[-9000:]
+        safety_errors = [
+            line for line in lines if line.startswith(SOURCE_SAFETY_PREFIX)
+        ]
+        if safety_errors:
+            return "\n".join(safety_errors)[-6000:]
         errors = [line for line in lines if COMPILER_ERROR_RE.search(line)]
         if errors:
             # Warnings often precede the first fatal diagnostic in historical
@@ -950,14 +1080,14 @@ class ProjectRepository:
         return COMPILER_ERROR_RE.search(output) is not None
 
     @staticmethod
-    def compiler_error_count(output: str) -> int:
-        return len(COMPILER_ERROR_RE.findall(output))
+    def has_source_safety_errors(output: str) -> bool:
+        return SOURCE_SAFETY_PREFIX in output
 
     @staticmethod
     def is_repairable_build_failure(output: str) -> bool:
-        """Allow model repair only for actual compiler/linker diagnostics."""
+        """Allow repair for compiler diagnostics and hard source-safety gates."""
 
-        return (
-            "BUILD/COMPARE TIMED OUT" not in output
-            and ProjectRepository.has_compiler_errors(output)
+        return "BUILD/COMPARE TIMED OUT" not in output and (
+            ProjectRepository.has_compiler_errors(output)
+            or ProjectRepository.has_source_safety_errors(output)
         )

@@ -378,23 +378,10 @@ def normalize_decompiler_seed(
 
     unresolved = list(dict.fromkeys(re.findall(r"\bDAT_([0-9A-Fa-f]{8})\b", source)))
     for raw_address in unresolved:
-        token = "DAT_" + raw_address
-        absolute = "0x" + raw_address
-        source, address_count = re.subn(
-            r"&\s*\b%s\b" % re.escape(token),
-            "(char *)" + absolute,
-            source,
+        changes.append(
+            "DAT_%s left unresolved for mandatory source-level global repair"
+            % raw_address
         )
-        source, value_count = _replace_token(
-            source,
-            token,
-            "(*(int *)%s)" % absolute,
-        )
-        if address_count or value_count:
-            changes.append(
-                "%s -> absolute fallback (%d address, %d value)"
-                % (token, address_count, value_count)
-            )
     return source, changes
 
 

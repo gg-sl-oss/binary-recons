@@ -33,6 +33,7 @@ from binary_recons.models import (  # noqa: E402
     ExactEdit,
     IdentifierReplacement,
     LlamaServerConfig,
+    MODEL_ENVIRONMENT_VARIABLE,
     ModelPreset,
     SearchConfig,
     ServerMode,
@@ -40,14 +41,16 @@ from binary_recons.models import (  # noqa: E402
     SourcePatch,
     SupportingInsertion,
     SymbolProposalBatch,
+    discover_default_model_path,
 )
 from binary_recons.repository import (  # noqa: E402
     ProjectRepository,
-    candidate_fingerprint,
     current_function,
     normalize_candidate_marker,
     rename_candidate_symbol,
     replace_or_insert_function,
+    source_safety_feedback,
+    source_safety_violations,
     validate_candidate,
 )
 from binary_recons.search import (  # noqa: E402
@@ -206,6 +209,73 @@ class FakeManagedServer:
 
 
 class RepositoryTests(unittest.TestCase):
+    def test_default_model_path_selects_the_best_cached_qwen_first_shard(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary)
+            write_fixture(
+                cache,
+                "models--unsloth--Qwen3.5-35B-GGUF/snapshots/old/BF16/"
+                "Qwen3.5-35B-BF16.gguf",
+                "old",
+            )
+            write_fixture(
+                cache,
+                "models--unsloth--Qwen3.8-27B-GGUF/snapshots/current/Q4_K_M/"
+                "Qwen3.8-27B-Q4_K_M.gguf",
+                "quantized",
+            )
+            expected = cache / (
+                "models--unsloth--Qwen3.8-27B-GGUF/snapshots/current/BF16/"
+                "Qwen3.8-27B-BF16-00001-of-00002.gguf"
+            )
+            write_fixture(cache, str(expected.relative_to(cache)), "first")
+            write_fixture(
+                cache,
+                "models--unsloth--Qwen3.8-27B-GGUF/snapshots/current/BF16/"
+                "Qwen3.8-27B-BF16-00002-of-00002.gguf",
+                "second",
+            )
+            write_fixture(
+                cache,
+                "models--unsloth--Qwen3.8-27B-GGUF/snapshots/current/mmproj-BF16.gguf",
+                "projector",
+            )
+            write_fixture(
+                cache,
+                "models--google--gemma-4-GGUF/snapshots/current/gemma-4-BF16.gguf",
+                "other family",
+            )
+            write_fixture(
+                cache,
+                "models--unsloth--Qwen4-72B-GGUF/snapshots/incomplete/BF16/"
+                "Qwen4-72B-BF16-00001-of-00002.gguf",
+                "missing its second shard",
+            )
+
+            with (
+                patch.dict(os.environ, {}, clear=True),
+                patch(
+                    "binary_recons.models.DEFAULT_HUGGINGFACE_HUB_CACHE",
+                    cache,
+                ),
+            ):
+                self.assertEqual(discover_default_model_path(), expected)
+
+    def test_explicit_model_environment_override_precedes_cache(self) -> None:
+        configured = Path("~/models/explicit.gguf").expanduser()
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.dict(
+                os.environ,
+                {MODEL_ENVIRONMENT_VARIABLE: "~/models/explicit.gguf"},
+                clear=True,
+            ):
+                self.assertEqual(
+                    discover_default_model_path(Path(temporary)),
+                    configured,
+                )
+
     def test_model_request_failure_has_a_concise_cli_error(self) -> None:
         stderr = io.StringIO()
         with (
@@ -243,8 +313,7 @@ class RepositoryTests(unittest.TestCase):
                     [
                         "--project-root",
                         str(root),
-                        "--address",
-                        "0x401000",
+                        "--next-function",
                         "--dry-run-prompt",
                     ]
                 )
@@ -271,9 +340,136 @@ class RepositoryTests(unittest.TestCase):
         self.assertNotIn("--draft-source", options)
         self.assertIn("--max-edits", options)
         self.assertIn("--max-iterations", options)
+        self.assertIn("--next-function", options)
+        with (
+            contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaises(SystemExit),
+        ):
+            parser.parse_args([])
         args = parser.parse_args(["--address", "0x401000"])
+        self.assertFalse(args.next_function)
         self.assertEqual(args.max_callees, 2)
-        self.assertEqual(args.max_tokens, 512)
+        self.assertEqual(args.max_tokens, 768)
+        self.assertTrue(parser.parse_args(["--next-function"]).next_function)
+
+    def test_next_target_uses_only_complete_exports_in_source_unit_ranges(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            make_fixture_project(root)
+            write_fixture(
+                root,
+                "src/sample.c",
+                "/* Function start: 0x401000 */\n"
+                "int ExistingFunction(void)\n"
+                "{\n"
+                "    return 0;\n"
+                "}\n",
+            )
+            write_fixture(
+                root,
+                "analysis/FUN_00401010.disassembled.txt",
+                "Function: FUN_00401010\nRET\n",
+            )
+            write_fixture(
+                root,
+                "analysis/FUN_00401010.decompiled.txt",
+                "void FUN_00401010(void) {}\n",
+            )
+            write_fixture(
+                root,
+                "analysis/FUN_00401020.disassembled.txt",
+                "Function: FUN_00401020\nRET\n",
+            )
+            write_fixture(
+                root,
+                "analysis/FUN_00401100.disassembled.txt",
+                "Function: _malloc\nRET\n",
+            )
+            write_fixture(
+                root,
+                "analysis/FUN_00401100.decompiled.txt",
+                "void * _malloc(void) {}\n",
+            )
+
+            self.assertEqual(
+                ProjectRepository(root).next_unreconstructed_address(),
+                0x00401010,
+            )
+
+    def test_next_target_repairs_an_unsafe_reconstruction_before_a_new_export(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            make_fixture_project(root)
+            write_fixture(
+                root,
+                "src/sample.c",
+                """/* Function start: 0x401000 */
+int ExistingFunction(void)
+{
+    return *(int *)0x00402040;
+}
+""",
+            )
+            write_fixture(
+                root,
+                "analysis/FUN_00401010.disassembled.txt",
+                "Function: FUN_00401010\nRET\n",
+            )
+            write_fixture(
+                root,
+                "analysis/FUN_00401010.decompiled.txt",
+                "void FUN_00401010(void) {}\n",
+            )
+
+            self.assertEqual(
+                ProjectRepository(root).next_unreconstructed_address(),
+                0x00401000,
+            )
+
+    def test_next_target_requires_an_explicit_safe_range(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            make_fixture_project(root)
+            config = (root / "binary-recons.toml").read_text(encoding="utf-8")
+            config = config.split("\n[[source_units]]", 1)[0] + "\n"
+            (root / "binary-recons.toml").write_text(config, encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "exclude CRT and library code"):
+                ProjectRepository(root).next_unreconstructed_address()
+
+    def test_next_target_stops_before_exports_beyond_the_safe_range(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            make_fixture_project(root)
+            write_fixture(
+                root,
+                "src/sample.c",
+                "/* Function start: 0x401000 */\n"
+                "int ExistingFunction(void)\n"
+                "{\n"
+                "    return 0;\n"
+                "}\n",
+            )
+            write_fixture(
+                root,
+                "analysis/FUN_00401100.disassembled.txt",
+                "Function: _malloc\nRET\n",
+            )
+            write_fixture(
+                root,
+                "analysis/FUN_00401100.decompiled.txt",
+                "void * _malloc(void) {}\n",
+            )
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "no source-unsafe reconstructions or unreconstructed",
+            ):
+                ProjectRepository(root).next_unreconstructed_address()
 
     def test_existing_definition_keeps_its_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -656,36 +852,6 @@ int ReadFixtureValue(void)
                     repository.allowed_support_paths(),
                 )
 
-    def test_fingerprint_includes_supporting_insertions(self) -> None:
-        common = {
-            "symbol": "ReadFixtureValue",
-            "prototype": "int ReadFixtureValue(void)",
-            "source": """/* Function start: 0x401000 */
-int ReadFixtureValue(void)
-{
-    return g_fixture_value;
-}""",
-        }
-        first = Candidate(
-            **common,
-            supporting_insertions=[
-                SupportingInsertion(
-                    path="include/globals.h",
-                    content="extern int g_fixture_value;",
-                )
-            ],
-        )
-        second = Candidate(
-            **common,
-            supporting_insertions=[
-                SupportingInsertion(
-                    path="include/globals.h",
-                    content="extern short g_fixture_value;",
-                )
-            ],
-        )
-        self.assertNotEqual(candidate_fingerprint(first), candidate_fingerprint(second))
-
     def test_feedback_distinguishes_compiler_errors_and_compacts_assembly(self) -> None:
         compiler = (
             "sample.c(3) : warning C4013: 'other' undefined\n"
@@ -697,7 +863,6 @@ int ReadFixtureValue(void)
 Similarity: 70.00%
 """
         self.assertTrue(ProjectRepository.has_compiler_errors(compiler))
-        self.assertEqual(ProjectRepository.compiler_error_count(compiler), 1)
         compile_feedback = ProjectRepository.compact_feedback(compiler, None)
         self.assertTrue(compile_feedback.startswith("sample.c(4) : error C2065"))
         self.assertNotIn("warning C4013", compile_feedback)
@@ -773,15 +938,19 @@ typedef struct tagRECT {
                 "int CalculateFixtureTotal(int count, RECT *bounds, long unused_flags)",
             )
             self.assertIn("g_fixture_value_00402010[count]", candidate.source)
-            self.assertIn("(*(int *)0x00402030) * 4", candidate.source)
+            self.assertIn("DAT_00402030 * 4", candidate.source)
             self.assertNotIn("g_fixture_handle_00402030", candidate.source)
-            self.assertIn("(*(int *)0x00409999)", candidate.source)
+            self.assertIn("DAT_00409999", candidate.source)
+            self.assertNotIn("(int *)0x", candidate.source)
             self.assertIn('puts("fixture text");', candidate.source)
             self.assertNotIn("s_fixture_text_00403000", candidate.source)
             self.assertIn("int result;", candidate.source)
             self.assertNotIn("param_1", candidate.source)
             self.assertTrue(
                 any("parameter param_1 -> count" in item for item in changes)
+            )
+            self.assertTrue(
+                any("mandatory source-level global repair" in item for item in changes)
             )
 
     def test_target_address_is_excluded_from_declaration_mapping(self) -> None:
@@ -795,6 +964,57 @@ typedef struct tagRECT {
             )
             self.assertNotIn(0x00401000, mapping)
             self.assertEqual(mapping[0x00402000], "ExistingFixtureAction")
+
+    def test_absolute_pointer_and_unresolved_global_are_source_safety_errors(
+        self,
+    ) -> None:
+        candidate = Candidate(
+            symbol="CheckFixtureScore",
+            prototype="void CheckFixtureScore(void)",
+            source="""/* Function start: 0x401000 */
+void CheckFixtureScore(void)
+{
+    int *raw_pointer = 0x00414980;
+    LPVOID raw_buffer = (LPVOID)0x00416688;
+
+    if (*(int *)0x004167a4 <= DAT_0041560c) {
+        *(short *)((char *)0x004166a6 + 0x1c) = 1;
+    }
+}""",
+        )
+        violations = source_safety_violations(candidate)
+        self.assertTrue(any("0x004167a4" in item for item in violations))
+        self.assertTrue(any("0x004166a6" in item for item in violations))
+        self.assertTrue(any("0x00414980" in item for item in violations))
+        self.assertTrue(any("0x00416688" in item for item in violations))
+        self.assertTrue(any("DAT_0041560c" in item for item in violations))
+        feedback = source_safety_feedback(candidate)
+        self.assertIsNotNone(feedback)
+        self.assertIn("SOURCE SAFETY ERROR:", feedback or "")
+
+        repaired = candidate.model_copy(
+            update={
+                "source": """/* Function start: 0x401000 */
+void CheckFixtureScore(void)
+{
+    if (g_fixture_scores_00416690[9].score <= g_fixture_score_0041560c) {
+        g_fixture_scores_00416690[1].level = 1;
+    }
+}"""
+            }
+        )
+        self.assertEqual(source_safety_violations(repaired), [])
+        comment_only = repaired.model_copy(
+            update={
+                "source": repaired.source.replace(
+                    "{\n",
+                    "{\n    /* never use *(int *)0x004167a4 */\n"
+                    '    const char *message = "(int *)0x004166a6";\n',
+                    1,
+                )
+            }
+        )
+        self.assertEqual(source_safety_violations(comment_only), [])
 
     def test_sanitizer_keeps_independent_operations_when_exact_text_is_stale(
         self,
@@ -836,6 +1056,28 @@ int ReadFixtureValue(void)
         self.assertEqual(sanitized.edits, [])
         self.assertTrue(rejected)
 
+    def test_sanitizer_rejects_a_new_absolute_pointer(self) -> None:
+        source = """/* Function start: 0x401000 */
+int ReadFixtureValue(void)
+{
+    return g_fixture_value_00402010[0];
+}"""
+        raw = SourcePatch(
+            edits=[
+                ExactEdit(
+                    old="g_fixture_value_00402010[0]",
+                    new="*(int *)0x00402010",
+                )
+            ]
+        )
+        sanitized, rejected = sanitize_source_patch(
+            source,
+            raw,
+            "ReadFixtureValue",
+        )
+        self.assertEqual(sanitized.edits, [])
+        self.assertTrue(any("absolute-address pointer" in item for item in rejected))
+
     def test_patch_application_reasserts_the_locked_header(self) -> None:
         candidate = Candidate(
             symbol="ReadFixtureValue",
@@ -855,8 +1097,144 @@ int ReadFixtureValue(void)
         self.assertIn("return 8;", repaired.source)
         self.assertEqual(repaired.source.count("Function start:"), 1)
 
+    def test_patch_application_accumulates_configured_global_insertions(self) -> None:
+        candidate = Candidate(
+            symbol="ReadFixtureValue",
+            prototype="int ReadFixtureValue(void)",
+            source="""/* Function start: 0x401000 */
+int ReadFixtureValue(void)
+{
+    return DAT_00402040;
+}""",
+        )
+        repaired = apply_source_patch(
+            candidate,
+            SourcePatch(
+                identifier_replacements=[
+                    IdentifierReplacement(
+                        old="DAT_00402040",
+                        new="g_fixture_score_00402040",
+                    )
+                ],
+                supporting_insertions=[
+                    SupportingInsertion(
+                        path="include/globals.h",
+                        content="extern int g_fixture_score_00402040;",
+                    ),
+                    SupportingInsertion(
+                        path="src/globals.c",
+                        content="int g_fixture_score_00402040;",
+                    ),
+                ],
+            ),
+            0x00401000,
+        )
+        self.assertIn("g_fixture_score_00402040", repaired.source)
+        self.assertEqual(len(repaired.supporting_insertions), 2)
+
 
 class StagedSearchTests(unittest.TestCase):
+    def test_existing_absolute_pointer_must_be_repaired_before_comparison(
+        self,
+    ) -> None:
+        class FakeClient:
+            prompts: list[str] = []
+
+            def __init__(self, *args: object):
+                pass
+
+            def repair_compile(self, prompt: str, round_number: int):
+                type(self).prompts.append(prompt)
+                if round_number != 1:
+                    raise AssertionError("unexpected safety-repair round")
+                if "SOURCE SAFETY ERROR:" not in prompt:
+                    raise AssertionError("source-safety feedback was not supplied")
+                if "CONFIGURED SUPPORT FILES" not in prompt:
+                    raise AssertionError("support-file context was not supplied")
+                return (
+                    SourcePatch(
+                        edits=[
+                            ExactEdit(
+                                old="*(int *)0x00402040",
+                                new="g_fixture_score_00402040",
+                            )
+                        ],
+                        supporting_insertions=[
+                            SupportingInsertion(
+                                path="include/globals.h",
+                                content="extern int g_fixture_score_00402040;",
+                            ),
+                            SupportingInsertion(
+                                path="src/globals.c",
+                                content="int g_fixture_score_00402040;",
+                            ),
+                        ],
+                    ),
+                    {},
+                )
+
+            def improve_similarity(self, *args: object):
+                raise AssertionError("the safety repair reaches the target")
+
+            def close(self) -> None:
+                pass
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            make_fixture_project(root)
+            write_fixture(
+                root,
+                "src/sample.c",
+                """#include "project.h"
+
+/* Function start: 0x401000 */
+int ReadFixtureValue(void)
+{
+    return *(int *)0x00402040;
+}
+""",
+            )
+            repository = ProjectRepository(root)
+            target = repository.resolve_target(0x00401000)
+            compare_calls = 0
+
+            def compare(*args: object):
+                nonlocal compare_calls
+                compare_calls += 1
+                source = target.source_path.read_text(encoding="utf-8")
+                self.assertNotIn("(int *)0x", source)
+                self.assertIn("g_fixture_score_00402040", source)
+                self.assertIn(
+                    "extern int g_fixture_score_00402040;",
+                    (root / "include/globals.h").read_text(encoding="utf-8"),
+                )
+                self.assertIn(
+                    "int g_fixture_score_00402040;",
+                    (root / "src/globals.c").read_text(encoding="utf-8"),
+                )
+                return 84.0, "Similarity: 84.00%"
+
+            repository.compare = compare  # type: ignore[method-assign]
+            with (
+                patch("binary_recons.search.ManagedLlamaServer", FakeManagedServer),
+                patch("binary_recons.search.StructuredModelClient", FakeClient),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                result = ReconstructionSearch(
+                    repository,
+                    target,
+                    SearchConfig(seed=target.address, max_edits=1),
+                    LlamaServerConfig(model_path=None, preset=ModelPreset.QWEN),
+                ).run()
+
+            self.assertTrue(result.target_reached)
+            self.assertEqual(compare_calls, 1)
+            self.assertEqual(len(FakeClient.prompts), 1)
+            self.assertNotIn(
+                "(int *)0x",
+                target.source_path.read_text(encoding="utf-8"),
+            )
+
     def test_explicit_contract_builds_a_seed_without_contract_inference(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -963,7 +1341,7 @@ class StagedSearchTests(unittest.TestCase):
             manifest = json.loads(
                 (result.session_directory / "run.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(manifest["workflow"], "ghidra-seed-bounded-qwen-edits-v1")
+            self.assertEqual(manifest["workflow"], "ghidra-seed-bounded-qwen-edits-v2")
             self.assertEqual(manifest["stop_reason"], "target-reached")
 
     def test_compiler_failure_is_given_to_qwen_before_the_source(self) -> None:
@@ -1042,9 +1420,106 @@ class StagedSearchTests(unittest.TestCase):
             edit_result = json.loads(
                 (result.session_directory / "edit-01.compile.result.json").read_text()
             )
-            self.assertTrue(edit_result["accepted"])
+            self.assertTrue(edit_result["followed"])
 
-    def test_non_improving_similarity_edit_is_rolled_back(self) -> None:
+    def test_compile_repair_follows_a_linker_failure_to_the_next_fix(self) -> None:
+        class FakeClient:
+            compile_prompts: list[str] = []
+
+            def __init__(self, *args: object):
+                pass
+
+            def infer_contract(self, prompt: str):
+                return (
+                    ContractProposal(
+                        symbol="ReadFixtureValue",
+                        prototype="int ReadFixtureValue(void)",
+                    ),
+                    {},
+                )
+
+            def propose_symbols(self, *args: object):
+                raise AssertionError("unexpected name repair")
+
+            def repair_compile(self, prompt: str, round_number: int):
+                type(self).compile_prompts.append(prompt)
+                if round_number == 1:
+                    return (
+                        SourcePatch(
+                            edits=[
+                                ExactEdit(
+                                    old="unknown_fixture_value",
+                                    new="7",
+                                    mode="all",
+                                )
+                            ]
+                        ),
+                        {},
+                    )
+                if round_number == 2:
+                    if "LNK2001" not in prompt or "LNK1120" not in prompt:
+                        raise AssertionError("linker failure was not followed")
+                    return (
+                        SourcePatch(edits=[ExactEdit(old="_rand()", new="rand()")]),
+                        {},
+                    )
+                raise AssertionError("unexpected compile-repair round")
+
+            def improve_similarity(self, *args: object):
+                raise AssertionError("the second repair reaches the target")
+
+            def close(self) -> None:
+                pass
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            make_fixture_project(
+                root,
+                "return unknown_fixture_value + _rand();",
+            )
+            repository = ProjectRepository(root)
+            target = repository.resolve_target(0x00401000)
+
+            def compare(*args: object):
+                source = target.source_path.read_text(encoding="utf-8")
+                if "unknown_fixture_value" in source:
+                    return None, (
+                        "sample.c(4) : error C2065: 'unknown_fixture_value' : "
+                        "undeclared identifier"
+                    )
+                if "_rand()" in source:
+                    return None, (
+                        "sample.obj : error LNK2001: unresolved external symbol "
+                        "__rand\n"
+                        "sample.exe : fatal error LNK1120: 1 unresolved externals"
+                    )
+                return 84.0, "Similarity: 84.00%"
+
+            repository.compare = compare  # type: ignore[method-assign]
+            with (
+                patch("binary_recons.search.ManagedLlamaServer", FakeManagedServer),
+                patch("binary_recons.search.StructuredModelClient", FakeClient),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                result = ReconstructionSearch(
+                    repository,
+                    target,
+                    SearchConfig(seed=target.address, max_edits=2),
+                    LlamaServerConfig(model_path=None, preset=ModelPreset.QWEN),
+                ).run()
+
+            self.assertTrue(result.target_reached)
+            self.assertEqual(result.score, 84.0)
+            self.assertEqual(len(FakeClient.compile_prompts), 2)
+            first_result = json.loads(
+                (result.session_directory / "edit-01.compile.result.json").read_text()
+            )
+            self.assertTrue(first_result["followed"])
+            self.assertIsNone(first_result["score"])
+
+    def test_search_can_follow_a_regression_back_to_an_earlier_candidate(
+        self,
+    ) -> None:
         class FakeClient:
             def __init__(self, *args: object):
                 pass
@@ -1065,10 +1540,18 @@ class StagedSearchTests(unittest.TestCase):
                 raise AssertionError("the seed compiles")
 
             def improve_similarity(self, prompt: str, round_number: int):
-                if "Similarity: 70.00%" not in prompt:
-                    raise AssertionError("similarity feedback was not supplied")
+                if round_number == 1:
+                    if "Similarity: 70.00%" not in prompt:
+                        raise AssertionError("baseline feedback was not supplied")
+                    edit = ExactEdit(old="return 7;", new="return 8;")
+                elif round_number == 2:
+                    if "Similarity: 60.00%" not in prompt or "return 8;" not in prompt:
+                        raise AssertionError("regressed trajectory was not followed")
+                    edit = ExactEdit(old="return 8;", new="return 7;")
+                else:
+                    raise AssertionError("unexpected similarity round")
                 return (
-                    SimilarityPatch(edit=ExactEdit(old="return 7;", new="return 8;")),
+                    SimilarityPatch(edit=edit),
                     {},
                 )
 
@@ -1099,7 +1582,7 @@ class StagedSearchTests(unittest.TestCase):
                 result = ReconstructionSearch(
                     repository,
                     target,
-                    SearchConfig(seed=target.address, max_edits=1),
+                    SearchConfig(seed=target.address, max_edits=2),
                     LlamaServerConfig(model_path=None, preset=ModelPreset.QWEN),
                 ).run()
 
@@ -1113,11 +1596,22 @@ class StagedSearchTests(unittest.TestCase):
                     result.session_directory / "edit-01.similarity.result.json"
                 ).read_text()
             )
-            self.assertFalse(decision["accepted"])
+            self.assertTrue(decision["followed"])
+            self.assertIn("return 8;", decision["candidate"]["source"])
+            return_result = json.loads(
+                (
+                    result.session_directory / "edit-02.similarity.result.json"
+                ).read_text()
+            )
+            self.assertTrue(return_result["followed"])
+            self.assertIn("return 7;", return_result["candidate"]["source"])
 
-    def test_rejected_similarity_trial_guides_the_next_edit(self) -> None:
+    def test_search_follows_a_temporary_build_failure_to_a_better_result(
+        self,
+    ) -> None:
         class FakeClient:
             similarity_prompts: list[str] = []
+            compile_prompts: list[str] = []
 
             def __init__(self, *args: object):
                 pass
@@ -1134,8 +1628,16 @@ class StagedSearchTests(unittest.TestCase):
             def propose_symbols(self, *args: object):
                 raise AssertionError("unexpected name repair")
 
-            def repair_compile(self, *args: object):
-                raise AssertionError("the retained candidate compiles")
+            def repair_compile(self, prompt: str, round_number: int):
+                type(self).compile_prompts.append(prompt)
+                if round_number != 2:
+                    raise AssertionError("only the temporary failure needs repair")
+                if "return 8;" not in prompt or "error C2065" not in prompt:
+                    raise AssertionError("repair did not follow the working trajectory")
+                return (
+                    SourcePatch(edits=[ExactEdit(old="return 8;", new="return 9;")]),
+                    {},
+                )
 
             def improve_similarity(self, prompt: str, round_number: int):
                 type(self).similarity_prompts.append(prompt)
@@ -1146,27 +1648,14 @@ class StagedSearchTests(unittest.TestCase):
                         ),
                         {},
                     )
-                if round_number == 2:
-                    required = (
-                        "Keep CURRENT SOURCE unchanged",
-                        "return 8;",
-                        "error C2065",
+                if round_number != 3:
+                    raise AssertionError("unexpected similarity round")
+                if "return 9;" not in prompt or "Similarity: 65.00%" not in prompt:
+                    raise AssertionError(
+                        "similarity edit did not follow the repaired source"
                     )
-                    if any(value not in prompt for value in required):
-                        raise AssertionError("rejected-trial evidence is incomplete")
-                    if prompt.index("error C2065") >= prompt.index("TASK"):
-                        raise AssertionError("rejected compiler feedback must be early")
-                    return (
-                        SimilarityPatch(
-                            edit=ExactEdit(old="return 7;", new="return 9;")
-                        ),
-                        {},
-                    )
-                required = ("return 8;", "error C2065", "return 9;", "65.00%")
-                if any(value not in prompt for value in required):
-                    raise AssertionError("rejection history did not survive")
                 return (
-                    SimilarityPatch(edit=ExactEdit(old="return 7;", new="return 10;")),
+                    SimilarityPatch(edit=ExactEdit(old="return 9;", new="return 10;")),
                     {},
                 )
 
@@ -1212,7 +1701,8 @@ class StagedSearchTests(unittest.TestCase):
 
             self.assertTrue(result.target_reached)
             self.assertEqual(result.score, 85.0)
-            self.assertEqual(len(FakeClient.similarity_prompts), 3)
+            self.assertEqual(len(FakeClient.similarity_prompts), 2)
+            self.assertEqual(len(FakeClient.compile_prompts), 1)
             source = target.source_path.read_text(encoding="utf-8")
             self.assertIn("return 10;", source)
             self.assertNotIn("return 8;", source)
@@ -1499,6 +1989,11 @@ class StructuredClientTests(unittest.TestCase):
                         ),
                         {},
                     )
+                if response_model is SourcePatch:
+                    return (
+                        SourcePatch(edits=[ExactEdit(old="missing", new="declared")]),
+                        {},
+                    )
                 return (
                     SymbolProposalBatch(
                         symbols=[
@@ -1542,15 +2037,24 @@ class StructuredClientTests(unittest.TestCase):
         ):
             client = StructuredModelClient(
                 FakeServer(),  # type: ignore[arg-type]
-                SearchConfig(seed=1, max_tokens=320),
+                SearchConfig(seed=1),
             )
             client.infer_contract("contract prompt")
             client.propose_symbols("name prompt", 1)
+            client.repair_compile("compile prompt", 1)
+            client.repair_compile("retry compile prompt", 2)
             client.improve_similarity("first edit prompt", 1)
             client.improve_similarity("retry edit prompt", 2)
             client.close()
 
-        contract_call, naming_call, first_edit_call, retry_edit_call = calls
+        (
+            contract_call,
+            naming_call,
+            compile_call,
+            retry_compile_call,
+            first_edit_call,
+            retry_edit_call,
+        ) = calls
         self.assertEqual(contract_call["max_tokens"], 192)
         self.assertEqual(contract_call["temperature"], 0.2)
         self.assertEqual(contract_call["presence_penalty"], 0.0)
@@ -1563,10 +2067,16 @@ class StructuredClientTests(unittest.TestCase):
         self.assertEqual(naming_call["max_tokens"], 160)
         self.assertEqual(naming_call["temperature"], 0.7)
         self.assertEqual(naming_call["presence_penalty"], 1.5)
-        self.assertEqual(first_edit_call["max_tokens"], 320)
+        self.assertEqual(compile_call["max_tokens"], 768)
+        self.assertEqual(compile_call["temperature"], 0.2)
+        self.assertEqual(compile_call["presence_penalty"], 0.0)
+        self.assertEqual(retry_compile_call["max_tokens"], 768)
+        self.assertEqual(retry_compile_call["temperature"], 0.7)
+        self.assertEqual(retry_compile_call["presence_penalty"], 1.5)
+        self.assertEqual(first_edit_call["max_tokens"], 512)
         self.assertEqual(first_edit_call["temperature"], 0.2)
         self.assertEqual(first_edit_call["presence_penalty"], 0.0)
-        self.assertEqual(retry_edit_call["max_tokens"], 320)
+        self.assertEqual(retry_edit_call["max_tokens"], 512)
         self.assertEqual(retry_edit_call["temperature"], 0.7)
         self.assertEqual(retry_edit_call["presence_penalty"], 1.5)
 

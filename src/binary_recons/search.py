@@ -1,8 +1,7 @@
-"""Compile-first Ghidra integration with bounded, monotonic model edits."""
+"""Compile-first Ghidra integration with bounded model-edit trajectories."""
 
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,10 +26,10 @@ from .prompts import (
 )
 from .repository import (
     ProjectRepository,
-    candidate_fingerprint,
     current_function,
     is_generic_function_symbol,
     rename_candidate_symbol,
+    source_safety_feedback,
     validate_candidate,
 )
 from .runlog import RunLog
@@ -104,48 +103,6 @@ def _rename_contract(contract: ContractProposal, symbol: str) -> ContractProposa
     return ContractProposal(symbol=symbol, prototype=prototype)
 
 
-def _quality(
-    repository: ProjectRepository,
-    score: float | None,
-    output: str,
-) -> tuple[int, float]:
-    if score is not None:
-        return 1, score
-    return 0, float(-repository.compiler_error_count(output))
-
-
-def _rejected_patch_feedback(
-    repository: ProjectRepository,
-    accepted: _Evaluation,
-    trial: _Evaluation,
-    patch: SourcePatch,
-) -> str:
-    """Give the next bounded turn enough measured evidence to avoid repetition."""
-
-    attempted = json.dumps(patch.model_dump(mode="json"), separators=(",", ":"))
-    if trial.score is not None:
-        assert accepted.score is not None
-        outcome = "Trial similarity %.2f%% did not exceed the retained %.2f%%." % (
-            trial.score,
-            accepted.score,
-        )
-    elif repository.has_compiler_errors(trial.output):
-        rendered = trial.workspace.get(trial.target.source_path.resolve())
-        outcome = "Trial did not compile:\n" + repository.compact_compile_feedback(
-            trial.output,
-            rendered,
-        )
-    else:
-        outcome = "Trial comparison failed:\n" + repository.compact_feedback(
-            trial.output,
-            None,
-        )
-    return (
-        "Keep CURRENT SOURCE unchanged; this measured trial was rejected.\n"
-        "Attempted patch: %s\n%s" % (attempted, outcome)
-    )
-
-
 class ReconstructionSearch:
     def __init__(
         self,
@@ -181,6 +138,15 @@ class ReconstructionSearch:
             candidate,
             baseline_workspace,
         )
+        safety_feedback = source_safety_feedback(candidate)
+        if safety_feedback is not None:
+            return _Evaluation(
+                candidate,
+                active_target,
+                trial_workspace,
+                None,
+                safety_feedback,
+            )
         try:
             self.repository.apply_workspace(trial_workspace)
             score, output = self.repository.compare(
@@ -251,10 +217,14 @@ class ReconstructionSearch:
             prototype=self.target.prototype,
             source=source,
         )
-        score, output = self.repository.compare(
-            self.target,
-            self.config.build_timeout,
-        )
+        output = source_safety_feedback(candidate)
+        if output is None:
+            score, output = self.repository.compare(
+                self.target,
+                self.config.build_timeout,
+            )
+        else:
+            score = None
         run_log.write_baseline(output)
         return _Evaluation(
             candidate,
@@ -398,9 +368,7 @@ class ReconstructionSearch:
         working = best_evaluation
         attempts = 0
         stop_reason = "edit-budget-exhausted"
-        seen: set[str] = set()
         if working is not None:
-            seen.add(candidate_fingerprint(working.candidate))
             if working.score is not None:
                 print("baseline similarity: %.2f%%" % working.score, flush=True)
                 if working.score >= self.config.target_score:
@@ -452,7 +420,6 @@ class ReconstructionSearch:
                         working.score,
                         "resumed-candidate",
                     )
-                    seen.add(candidate_fingerprint(candidate))
                     if working.score is not None and (
                         best_evaluation is None
                         or best_evaluation.score is None
@@ -486,7 +453,6 @@ class ReconstructionSearch:
                     working.score,
                     "configured-contract",
                 )
-                seen.add(candidate_fingerprint(candidate))
                 if working.score is not None and (
                     best_evaluation is None
                     or best_evaluation.score is None
@@ -607,7 +573,6 @@ class ReconstructionSearch:
                                 working.score,
                                 origin,
                             )
-                            seen.add(candidate_fingerprint(candidate))
                             if working.score is not None and (
                                 best_evaluation is None
                                 or best_evaluation.score is None
@@ -703,7 +668,11 @@ class ReconstructionSearch:
                                 raw_patch,
                                 working.candidate.symbol,
                             )
-                            if not patch.edits and not patch.identifier_replacements:
+                            if (
+                                not patch.edits
+                                and not patch.identifier_replacements
+                                and not patch.supporting_insertions
+                            ):
                                 rejection = (
                                     "Keep CURRENT SOURCE unchanged. Attempted patch: %s\n%s"
                                     % (
@@ -733,12 +702,6 @@ class ReconstructionSearch:
                                     patch,
                                     self.target.address,
                                 )
-                                fingerprint = candidate_fingerprint(trial_candidate)
-                                if fingerprint in seen:
-                                    raise ValueError(
-                                        "patch reproduces an earlier candidate"
-                                    )
-                                seen.add(fingerprint)
                                 trial = self._evaluate(
                                     trial_candidate,
                                     working.target,
@@ -769,18 +732,6 @@ class ReconstructionSearch:
                                 print("edit %d: rejected before build" % round_number)
                                 continue
 
-                            accepted = (
-                                trial.score is not None
-                                or self.repository.has_compiler_errors(trial.output)
-                            ) and _quality(
-                                self.repository,
-                                trial.score,
-                                trial.output,
-                            ) > _quality(
-                                self.repository,
-                                working.score,
-                                working.output,
-                            )
                             run_log.write_edit_result(
                                 round_number,
                                 kind,
@@ -789,23 +740,9 @@ class ReconstructionSearch:
                                 rejected,
                                 trial.output,
                                 trial.score,
-                                accepted,
+                                True,
                                 patch_metrics(trial.candidate, patch),
                             )
-                            if not accepted:
-                                rejection_history.append(
-                                    _rejected_patch_feedback(
-                                        self.repository,
-                                        working,
-                                        trial,
-                                        patch,
-                                    )
-                                )
-                                print(
-                                    "edit %d: measured result rejected" % round_number
-                                )
-                                continue
-
                             working = trial
                             rejection_history.clear()
                             if trial.score is not None and (
@@ -817,10 +754,22 @@ class ReconstructionSearch:
                                 best_workspace = trial.workspace
                                 self.repository.apply_workspace(best_workspace)
                             print(
-                                "edit %d: accepted, %s"
+                                "edit %d: followed, %s"
                                 % (
                                     round_number,
-                                    "build still failing"
+                                    (
+                                        "source safety still failing"
+                                        if self.repository.has_source_safety_errors(
+                                            trial.output
+                                        )
+                                        else (
+                                            "build still failing"
+                                            if self.repository.has_compiler_errors(
+                                                trial.output
+                                            )
+                                            else "comparison failed"
+                                        )
+                                    )
                                     if trial.score is None
                                     else "similarity %.2f%%" % trial.score,
                                 ),

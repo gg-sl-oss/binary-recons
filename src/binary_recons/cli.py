@@ -42,7 +42,20 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="project configuration (default: <project-root>/binary-recons.toml)",
     )
-    target.add_argument("--address", type=_integer, required=True)
+    selection = target.add_mutually_exclusive_group(required=True)
+    selection.add_argument(
+        "--address",
+        type=_integer,
+        help="target a specific function address",
+    )
+    selection.add_argument(
+        "--next-function",
+        action="store_true",
+        help=(
+            "repair the next source-unsafe reconstruction, otherwise select "
+            "the next unreconstructed export inside source_units"
+        ),
+    )
     target.add_argument(
         "--symbol",
         help="optional fixed symbol; default: model proposes one for new functions",
@@ -86,7 +99,7 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument(
         "--max-tokens",
         type=int,
-        default=512,
+        default=768,
         help="hard output-token cap; each staged request applies a lower cap",
     )
     search.add_argument(
@@ -132,7 +145,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--model-path",
         type=Path,
         default=DEFAULT_MODEL_PATH,
-        help="GGUF path (default: BINARY_RECONS_MODEL_PATH when set)",
+        help=(
+            "GGUF path (default: BINARY_RECONS_MODEL_PATH, then a cached Qwen "
+            "model under ~/.cache/huggingface/hub)"
+        ),
     )
     server.add_argument("--model", help="llama-server alias (default: GGUF filename)")
     server.add_argument(
@@ -157,8 +173,20 @@ def main(argv: list[str] | None = None) -> int:
             "--reopen-contract cannot be combined with --symbol or --prototype"
         )
     repository = ProjectRepository(args.project_root, args.config)
+    address = (
+        repository.next_unreconstructed_address()
+        if args.next_function
+        else args.address
+    )
+    if address is None:
+        raise RuntimeError("internal error: no target selection was parsed")
+    if args.next_function:
+        print(
+            "selected next reconstruction target 0x%08X from source_units" % address,
+            flush=True,
+        )
     target = repository.resolve_target(
-        address=args.address,
+        address=address,
         symbol=args.symbol,
         source=args.source,
         prototype=args.prototype,
@@ -185,7 +213,7 @@ def main(argv: list[str] | None = None) -> int:
         request_timeout=args.request_timeout,
         build_timeout=args.build_timeout,
         format_retries=args.format_retries,
-        seed=args.seed if args.seed is not None else args.address,
+        seed=args.seed if args.seed is not None else target.address,
         temperature=args.temperature,
         top_p=args.top_p,
         top_k=args.top_k,

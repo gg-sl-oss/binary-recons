@@ -92,8 +92,9 @@ class ManagedLlamaServer:
                 raise RuntimeError("llama-server binary does not exist: %s" % binary)
             if self.config.model_path is None:
                 raise RuntimeError(
-                    "no model configured; pass --model-path or set "
-                    "BINARY_RECONS_MODEL_PATH"
+                    "no model configured; pass --model-path, set "
+                    "BINARY_RECONS_MODEL_PATH, or cache a Qwen GGUF under "
+                    "~/.cache/huggingface/hub"
                 )
             if not self.config.model_path.exists():
                 raise RuntimeError("model does not exist: %s" % self.config.model_path)

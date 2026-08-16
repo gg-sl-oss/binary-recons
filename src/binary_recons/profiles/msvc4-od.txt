@@ -14,6 +14,13 @@ MICROSOFT VISUAL C++ 4.x /Od PROFILE
 - Prefer the target project's central declarations and historical platform
   types over modern substitutes so imported API names and argument widths stay
   correct.
+- Never express image data as a cast or dereference of a numeric absolute
+  address. Resolve it to a meaningful declared global, aggregate element, or
+  field; add a configured extern/definition pair when it is genuinely a new
+  standalone global.
+- Ghidra may expose the leading underscore used by decorated x86 symbols for
+  ISO C runtime calls. Use the source-level spelling (`rand`, `strcpy`,
+  `memcpy`, and so on), never `_rand`, `_strcpy`, or a reconstructed CRT body.
 - Do not use inline assembly merely to force a match. It is appropriate only
   when the original instructions themselves provide strong evidence of
   hand-written assembly.

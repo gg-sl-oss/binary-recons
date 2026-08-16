@@ -78,7 +78,8 @@ class StructuredModelClient:
             prompt,
             SourcePatch,
             seed=self.config.seed + 1000 + round_number,
-            max_tokens=320,
+            max_tokens=768,
+            diverse=round_number > 1,
         )
 
     def improve_similarity(

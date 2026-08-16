@@ -31,7 +31,7 @@ class RunLog:
         self._manifest: dict[str, Any] = {
             "started_at": utc_now(),
             "status": "running",
-            "workflow": "ghidra-seed-bounded-qwen-edits-v1",
+            "workflow": "ghidra-seed-bounded-qwen-edits-v2",
             "target": target.model_dump(mode="json"),
             "search": config.model_dump(mode="json"),
             "python_dependencies": {
@@ -159,14 +159,14 @@ class RunLog:
         rejected_operations: list[str],
         comparison: str,
         score: float | None,
-        accepted: bool,
+        followed: bool,
         metrics: dict[str, int],
     ) -> None:
         prefix = self.directory / ("edit-%02d.%s" % (round_number, kind))
         write_json(
             Path(str(prefix) + ".result.json"),
             {
-                "accepted": accepted,
+                "followed": followed,
                 "candidate": (
                     candidate.model_dump(mode="json") if candidate is not None else None
                 ),

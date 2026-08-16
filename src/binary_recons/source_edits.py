@@ -4,7 +4,14 @@ from __future__ import annotations
 
 import re
 
-from .models import Candidate, ContractProposal, ExactEdit, SourcePatch
+from .models import (
+    Candidate,
+    ContractProposal,
+    ExactEdit,
+    SourcePatch,
+    SupportingInsertion,
+)
+from .repository import absolute_pointer_casts
 from .seed import candidate_from_seed
 
 
@@ -19,6 +26,32 @@ def _unsafe_new_text(text: str) -> str | None:
     if "```" in text or re.search(r"(?m)^\s*#", text):
         return "introduces Markdown or a preprocessor directive"
     return None
+
+
+def _introduces_absolute_pointer(old: str, new: str) -> bool:
+    return len(absolute_pointer_casts(new)) > len(absolute_pointer_casts(old))
+
+
+def _merge_supporting_insertions(
+    current: list[SupportingInsertion],
+    additions: list[SupportingInsertion],
+) -> list[SupportingInsertion]:
+    merged = list(current)
+    by_path = {insertion.path: index for index, insertion in enumerate(merged)}
+    for addition in additions:
+        index = by_path.get(addition.path)
+        if index is None:
+            by_path[addition.path] = len(merged)
+            merged.append(addition)
+            continue
+        existing = merged[index]
+        if addition.content in existing.content:
+            continue
+        merged[index] = SupportingInsertion(
+            path=existing.path,
+            content=existing.content.rstrip() + "\n\n" + addition.content,
+        )
+    return merged
 
 
 def sanitize_source_patch(
@@ -37,6 +70,11 @@ def sanitize_source_patch(
         unsafe = _unsafe_new_text(edit.new)
         if unsafe is not None:
             rejected.append("edit %d rejected: %s" % (index, unsafe))
+            continue
+        if _introduces_absolute_pointer(edit.old, edit.new):
+            rejected.append(
+                "edit %d rejected: introduces an absolute-address pointer" % index
+            )
             continue
         old_balance = edit.old.count("{") - edit.old.count("}")
         new_balance = edit.new.count("{") - edit.new.count("}")
@@ -82,7 +120,11 @@ def sanitize_source_patch(
         replacements.append(replacement)
 
     return (
-        SourcePatch(identifier_replacements=replacements, edits=edits),
+        SourcePatch(
+            identifier_replacements=replacements,
+            edits=edits,
+            supporting_insertions=patch.supporting_insertions,
+        ),
         rejected,
     )
 
@@ -120,7 +162,10 @@ def apply_source_patch(
         source,
         contract=_candidate_contract(candidate),
         address=address,
-        supporting_insertions=candidate.supporting_insertions,
+        supporting_insertions=_merge_supporting_insertions(
+            candidate.supporting_insertions,
+            patch.supporting_insertions,
+        ),
     )
 
 
@@ -134,6 +179,10 @@ def patch_metrics(candidate: Candidate, patch: SourcePatch) -> dict[str, int]:
         "source_lines": len(candidate.source.splitlines()),
         "identifier_replacements": len(patch.identifier_replacements),
         "exact_edits": len(patch.edits),
+        "supporting_insertions": len(patch.supporting_insertions),
+        "supporting_chars": sum(
+            len(insertion.content) for insertion in patch.supporting_insertions
+        ),
         "old_text_chars": sum(len(edit.old) for edit in patch.edits),
         "new_text_chars": sum(len(edit.new) for edit in patch.edits),
     }
