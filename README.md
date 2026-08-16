@@ -89,9 +89,7 @@ end = 0x0040ffff
 `source_units` is also the safety allowlist for automatic target selection.
 Keep compiler runtime and third-party library address ranges outside it. When
 `--next-function` is used, the tool never searches beyond these configured
-ranges. It repairs the lowest-address existing reconstruction that violates the
-source-safety gate before selecting a fresh export, so dangerous generated
-source is not silently left behind.
+ranges and considers only exports without an existing source marker.
 
 The comparison command may use `{symbol}`, `{address}`, and `{address_hex}`. It
 must compile the current source and print a `Similarity: N%` line from the
@@ -136,9 +134,9 @@ binary-recons --project-root /path/to/target --next-function
 
 Automatic selection considers only addresses allowlisted by `source_units`, so
 it does not drift into compiler runtime or library exports. It fails closed when
-no ranges are configured. A fresh candidate must have both assembly and
-decompiler exports and no existing source marker; a source-unsafe marked
-function with complete exports takes priority for repair.
+no ranges are configured. A candidate must have both assembly and decompiler
+exports and no existing source marker. Use an explicit `--address` when an
+existing reconstruction should be audited or improved.
 
 Pass `--address` to choose a particular new target or improve an existing one:
 

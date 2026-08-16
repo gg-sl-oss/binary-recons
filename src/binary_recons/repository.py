@@ -317,7 +317,7 @@ class ProjectRepository:
         self.config: ProjectConfig = load_project_config(self.root, config_path)
 
     def next_unreconstructed_address(self) -> int:
-        """Return the first unsafe reconstruction or unimplemented safe export."""
+        """Return the first unimplemented export inside the configured safe ranges."""
 
         if not self.config.source_units:
             raise RuntimeError(
@@ -326,30 +326,22 @@ class ProjectRepository:
             )
 
         reconstructed: set[int] = set()
-        unsafe_reconstructions: set[int] = set()
         for directory in self.config.source_paths(self.root):
             if not directory.exists():
                 continue
             for path in sorted(directory.rglob("*")):
                 if not path.is_file() or path.suffix.lower() not in SOURCE_SUFFIXES:
                     continue
-                source = read_text(path)
-                for marker in MARKER_RE.finditer(source):
-                    address = int(marker.group(1), 16)
-                    reconstructed.add(address)
-                    function = current_function(source, address)
-                    if function is not None and source_text_safety_violations(
-                        function,
-                        "target source",
-                    ):
-                        unsafe_reconstructions.add(address)
+                reconstructed.update(
+                    int(marker.group(1), 16)
+                    for marker in MARKER_RE.finditer(read_text(path))
+                )
 
         exports = self.config.resolve(self.root, self.config.exports_dir)
         if not exports.is_dir():
             raise RuntimeError("missing exports directory: %s" % exports)
 
         candidates: set[int] = set()
-        complete_exports: set[int] = set()
         for assembly_path in exports.glob("FUN_*.disassembled.txt"):
             match = ASSEMBLY_EXPORT_RE.fullmatch(assembly_path.name)
             if match is None:
@@ -362,18 +354,13 @@ class ProjectRepository:
             decompiled_path = exports / ("FUN_%08X.decompiled.txt" % address)
             if not decompiled_path.is_file():
                 continue
-            complete_exports.add(address)
             if address not in reconstructed:
                 candidates.add(address)
 
-        unsafe_candidates = unsafe_reconstructions & complete_exports
-        if unsafe_candidates:
-            return min(unsafe_candidates)
-
         if not candidates:
             raise RuntimeError(
-                "no source-unsafe reconstructions or unreconstructed function "
-                "exports remain inside the configured source_units ranges"
+                "no unreconstructed function exports remain inside the configured "
+                "source_units ranges"
             )
         return min(candidates)
 

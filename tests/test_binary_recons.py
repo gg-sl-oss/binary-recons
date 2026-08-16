@@ -398,7 +398,7 @@ class RepositoryTests(unittest.TestCase):
                 0x00401010,
             )
 
-    def test_next_target_repairs_an_unsafe_reconstruction_before_a_new_export(
+    def test_next_target_skips_an_unsafe_existing_reconstruction(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -427,7 +427,7 @@ int ExistingFunction(void)
 
             self.assertEqual(
                 ProjectRepository(root).next_unreconstructed_address(),
-                0x00401000,
+                0x00401010,
             )
 
     def test_next_target_requires_an_explicit_safe_range(self) -> None:
@@ -467,7 +467,7 @@ int ExistingFunction(void)
 
             with self.assertRaisesRegex(
                 RuntimeError,
-                "no source-unsafe reconstructions or unreconstructed",
+                "no unreconstructed function exports remain",
             ):
                 ProjectRepository(root).next_unreconstructed_address()
 

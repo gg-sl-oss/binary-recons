@@ -52,8 +52,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--next-function",
         action="store_true",
         help=(
-            "repair the next source-unsafe reconstruction, otherwise select "
-            "the next unreconstructed export inside source_units"
+            "select the next unreconstructed export inside the configured "
+            "source_units safety ranges"
         ),
     )
     target.add_argument(
@@ -182,7 +182,7 @@ def main(argv: list[str] | None = None) -> int:
         raise RuntimeError("internal error: no target selection was parsed")
     if args.next_function:
         print(
-            "selected next reconstruction target 0x%08X from source_units" % address,
+            "selected next unreconstructed target 0x%08X from source_units" % address,
             flush=True,
         )
     target = repository.resolve_target(
