@@ -630,6 +630,7 @@ typedef struct tagRECT {
 {
     bool result;
     ExistingFixtureAction();
+    puts(s_fixture_text_00403000);
     result = DAT_00402010[param_1] + DAT_00409999;
     return result;
 }
@@ -651,6 +652,8 @@ typedef struct tagRECT {
             )
             self.assertIn("g_fixture_value_00402010[count]", candidate.source)
             self.assertIn("(*(int *)0x00409999)", candidate.source)
+            self.assertIn('puts("fixture text");', candidate.source)
+            self.assertNotIn("s_fixture_text_00403000", candidate.source)
             self.assertIn("int result;", candidate.source)
             self.assertNotIn("param_1", candidate.source)
             self.assertTrue(

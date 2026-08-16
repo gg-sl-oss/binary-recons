@@ -199,6 +199,27 @@ def declaration_address_symbols(
     }
 
 
+def _string_address_literals(repository: ProjectRepository) -> dict[int, str]:
+    """Return exact C string literals from the configured address map."""
+
+    configured = repository.config.strings_file
+    if configured is None:
+        return {}
+    path = repository.config.resolve(repository.root, configured)
+    if not path.exists():
+        return {}
+
+    literals: dict[int, str] = {}
+    for line in read_text(path).splitlines():
+        match = re.match(
+            r'^\s*0x([0-9A-Fa-f]{6,8})\s*:\s*("(?:\\.|[^"\\])*")',
+            line,
+        )
+        if match is not None:
+            literals[int(match.group(1), 16)] = match.group(2)
+    return literals
+
+
 def _normalize_struct_tags(source: str, declarations: str) -> tuple[str, list[str]]:
     changes: list[str] = []
     for match in re.finditer(
@@ -283,6 +304,25 @@ def normalize_decompiler_seed(
             changes.append(
                 "%s -> %s (%d address, %d value)"
                 % (token, replacement, address_count, value_count)
+            )
+
+    string_literals = _string_address_literals(repository)
+    string_tokens = list(
+        dict.fromkeys(re.findall(r"\bs_[A-Za-z0-9_]*_([0-9A-Fa-f]{8})\b", source))
+    )
+    for raw_address in string_tokens:
+        address = int(raw_address, 16)
+        literal = string_literals.get(address)
+        if literal is None:
+            continue
+        source, count = re.subn(
+            r"\bs_[A-Za-z0-9_]*_%s\b" % re.escape(raw_address),
+            lambda _match: literal,
+            source,
+        )
+        if count:
+            changes.append(
+                "string label at 0x%08X -> configured literal (%d)" % (address, count)
             )
 
     unresolved = list(dict.fromkeys(re.findall(r"\bDAT_([0-9A-Fa-f]{8})\b", source)))
