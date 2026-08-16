@@ -137,6 +137,7 @@ class ReconstructionSearch:
             active_target,
             reserved_symbols,
             allowed_support_paths,
+            self.repository.config.require_global_address_suffix,
         )
         trial_workspace = self.repository.render_candidate_workspace(
             active_target,

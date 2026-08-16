@@ -79,6 +79,7 @@ class ProjectConfig(BaseModel):
     compare_command: list[str] = Field(min_length=1)
     source_units: list[SourceUnit] = Field(default_factory=list)
     skip_addresses: list[int] = Field(default_factory=list)
+    require_global_address_suffix: bool = False
 
     @model_validator(mode="after")
     def validate_support_files(self) -> "ProjectConfig":
@@ -117,6 +118,13 @@ class ProjectConfig(BaseModel):
 
     def guidance(self, root: Path, character_limit: int = 16000) -> str:
         blocks: list[str] = []
+        if self.require_global_address_suffix:
+            blocks.append(
+                "[configured global naming policy]\n"
+                "- Every newly declared source-level global must end with its "
+                "evidenced hexadecimal address, for example "
+                "g_windowHandle_00412000."
+            )
         for profile in self.rule_profiles:
             blocks.append(
                 "[shared profile: %s]\n%s" % (profile, load_rule_profile(profile))

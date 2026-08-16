@@ -80,6 +80,7 @@ rule_profiles = ["c89", "msvc4-od"]
 prompt_files = ["RECONSTRUCTION.md"]
 compare_command = ["make", "compare-func", "FUNC={symbol}", "ADDR={address_hex}"]
 skip_addresses = [0x00408000]
+require_global_address_suffix = true
 
 [[source_units]]
 path = "src/game.c"
@@ -94,6 +95,8 @@ ranges and considers only exports without an existing source marker.
 `skip_addresses` records missing targets deliberately deferred as unsuitable for
 bounded automatic passes. It affects only `--next-function`; an explicit
 `--address` can still revisit one.
+`require_global_address_suffix` rejects new globals that do not preserve their
+evidenced address and rejects unused support globals regardless of this option.
 
 The comparison command may use `{symbol}`, `{address}`, and `{address_hex}`. It
 must compile the current source and print a `Similarity: N%` line from the

@@ -893,6 +893,45 @@ int ReadFixtureValue(void)
                     repository.allowed_support_paths(),
                 )
 
+    def test_new_support_globals_must_be_used_and_can_require_an_address(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            make_fixture_project(root)
+            repository = ProjectRepository(root)
+            target = repository.resolve_target(0x00401000)
+            candidate = Candidate(
+                symbol="ReadFixtureValue",
+                prototype="int ReadFixtureValue(void)",
+                source="""/* Function start: 0x401000 */
+int ReadFixtureValue(void)
+{
+    return g_fixtureValue;
+}""",
+                supporting_insertions=[
+                    SupportingInsertion(
+                        path="include/globals.h",
+                        content=(
+                            "extern int g_fixtureValue;\n"
+                            "extern int g_unusedValue_00402044;"
+                        ),
+                    ),
+                    SupportingInsertion(
+                        path="src/globals.c",
+                        content="int g_fixtureValue;\nint g_unusedValue_00402044;",
+                    ),
+                ],
+            )
+            with self.assertRaises(ValueError) as raised:
+                validate_candidate(
+                    candidate,
+                    target.with_candidate_contract(candidate),
+                    set(),
+                    repository.allowed_support_paths(),
+                    require_global_address_suffix=True,
+                )
+            self.assertIn("unused global", str(raised.exception))
+            self.assertIn("hexadecimal address suffix", str(raised.exception))
+
     def test_feedback_distinguishes_compiler_errors_and_compacts_assembly(self) -> None:
         compiler = (
             "sample.c(3) : warning C4013: 'other' undefined\n"

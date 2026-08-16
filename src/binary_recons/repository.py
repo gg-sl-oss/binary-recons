@@ -236,6 +236,7 @@ def validate_candidate(
     target: TargetSpec,
     reserved_symbols: set[str] | None = None,
     allowed_support_paths: set[str] | None = None,
+    require_global_address_suffix: bool = False,
 ) -> None:
     source = candidate.source
     canonical_marker = "/* Function start: 0x%X */" % target.address
@@ -276,6 +277,7 @@ def validate_candidate(
         errors.append("candidate braces are unbalanced")
 
     insertion_paths: set[str] = set()
+    inserted_globals: set[str] = set()
     total_insertion_chars = sum(
         len(insertion.content) for insertion in candidate.supporting_insertions
     )
@@ -310,8 +312,43 @@ def validate_candidate(
                 errors.append(
                     "support insertion redeclares existing function: %s" % symbol
                 )
+        inserted_globals.update(_support_global_symbols(insertion.content))
+    for symbol in sorted(inserted_globals):
+        if re.search(r"\b%s\b" % re.escape(symbol), source) is None:
+            errors.append("support insertion declares unused global: %s" % symbol)
+        if (
+            require_global_address_suffix
+            and re.search(r"_[0-9A-Fa-f]{6,16}$", symbol) is None
+        ):
+            errors.append(
+                "new global must preserve its hexadecimal address suffix: %s" % symbol
+            )
     if errors:
         raise ValueError("; ".join(errors))
+
+
+def _support_global_symbols(text: str) -> set[str]:
+    """Extract simple file-scope objects from a bounded support insertion."""
+
+    symbols: set[str] = set()
+    for statement in _mask_c_non_code(text).split(";"):
+        declarator = statement.split("=", 1)[0].strip()
+        if (
+            not declarator
+            or declarator.startswith("typedef ")
+            or "(" in declarator
+            or "{" in declarator
+            or "}" in declarator
+        ):
+            continue
+        match = re.search(
+            r"\b([A-Za-z_][A-Za-z0-9_]*)\s*"
+            r"(?:\[[^\]]+\]\s*)*$",
+            declarator,
+        )
+        if match is not None:
+            symbols.add(match.group(1))
+    return symbols
 
 
 class ProjectRepository:
